@@ -19,6 +19,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import main as m
 
 
+@pytest.fixture(autouse=True)
+def reset_provider_cooldown(monkeypatch):
+    # Shared worker cooldown must never make independent tests influence each other.
+    monkeypatch.setattr(m, '_provider_quota_until', 0.0)
+
+
 CAT = {'products': [
     {'handle': 'velvet-money-envelope', 'title': 'Velvet Money Envelope', 'description': 'Elegant envelope',
      'available': True, 'price': '20.0 KWD', 'image': 'https://example.org/velvet.jpg', 'tags': ['gift'],
@@ -190,7 +196,8 @@ def test_fail_429_is_not_retried(monkeypatch):
         def __init__(self,**_kw):self.chat=SimpleNamespace(completions=SimpleNamespace(create=self.create))
         def create(self,**kwargs): called.append(1); raise Throttle()
     monkeypatch.setattr(m,'Groq',Client)
-    with pytest.raises(Throttle):m._chat_sync(user('هلا'))
+    with pytest.raises(m.ProviderFailure) as caught:m._chat_sync(user('هلا'))
+    assert caught.value.code=='AI_RATE_LIMIT'
     assert len(called)==1
 
 
@@ -237,5 +244,74 @@ def test_http_error_exposes_no_keys(monkeypatch):
     with TestClient(m.app) as app:
         response=app.post('/api/chat',json={'messages':[{'role':'user','content':'hello'}]})
         assert response.status_code==503
-        assert response.json()['code']=='AI_CONNECTION_FAILED'
+        assert response.json()['code']=='AI_PROVIDER_ERROR'
         assert 'test-secret-key' not in response.text
+
+
+def test_alf_parity_fallback_order_and_completion_settings(monkeypatch):
+    monkeypatch.setattr(m,'PRIMARY_MODEL','openai/gpt-oss-20b')
+    monkeypatch.setattr(m,'FALLBACK_MODEL','')
+    assert m._models()==['openai/gpt-oss-20b','openai/gpt-oss-120b','qwen/qwen3.8-27b']
+    assert m.MAX_OUTPUT==1400
+    assert m.GROQ_MAX_RETRIES==2
+    assert m.GROQ_REQUEST_TIMEOUT==85
+
+
+def test_provider_error_types_and_retry_header():
+    class Limit(Exception):
+        status_code=429
+        response=SimpleNamespace(headers={'retry-after':'17.2'})
+    x=m._provider_error(Limit())
+    assert x.code=='AI_RATE_LIMIT' and x.wait==18
+    class Failure(Exception): status_code=401
+    assert m._provider_error(Failure()).code=='AI_CONFIGURATION_ERROR'
+    assert m._provider_error(ValueError('bad JSON')).code=='AI_BAD_OUTPUT'
+    assert m._provider_retry_seconds(SimpleNamespace(response=SimpleNamespace(headers={'x-ratelimit-reset-tokens':'1m15.2s'})))==76
+
+
+def test_transient_primary_failure_falls_back_once(monkeypatch):
+    monkeypatch.setattr(m,'GROQ_API_KEY','test')
+    monkeypatch.setattr(m.CATALOG,'value',CAT);monkeypatch.setattr(m.CATALOG,'at',m.time.monotonic())
+    monkeypatch.setattr(m.PAGES,'value',[]);monkeypatch.setattr(m.PAGES,'at',m.time.monotonic())
+    attempted=[]
+    class FakeClient:
+        def __init__(self,**kwargs):
+            self.chat=SimpleNamespace(completions=SimpleNamespace(create=self.create))
+            assert kwargs['max_retries']==2
+        def create(self,**kwargs):
+            attempted.append(kwargs['model'])
+            if len(attempted)==1:
+                raise ValueError('temporary invalid JSON')
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"reply":"مبروك على الفرح!","actions":[],"context":{},"products":[]}'))],usage=None)
+    monkeypatch.setattr(m,'Groq',FakeClient)
+    result=m._chat_sync(user('عندي فرح'))
+    assert result['reply']=='مبروك على الفرح!'
+    assert attempted==['openai/gpt-oss-20b','openai/gpt-oss-120b']
+
+
+def test_quota_cooldown_prevents_repeated_model_calls(monkeypatch):
+    monkeypatch.setattr(m,'GROQ_API_KEY','test')
+    monkeypatch.setattr(m.CATALOG,'value',CAT);monkeypatch.setattr(m.CATALOG,'at',m.time.monotonic())
+    monkeypatch.setattr(m.PAGES,'value',[]);monkeypatch.setattr(m.PAGES,'at',m.time.monotonic())
+    called=[]
+    class Limit(Exception):status_code=429;response=SimpleNamespace(headers={'retry-after':'12'})
+    class Client:
+        def __init__(self,**kwargs): self.chat=SimpleNamespace(completions=SimpleNamespace(create=self.create))
+        def create(self,**kwargs):called.append(kwargs);raise Limit()
+    monkeypatch.setattr(m,'Groq',Client)
+    with pytest.raises(m.ProviderFailure) as first:m._chat_sync(user('هلا'))
+    assert first.value.code=='AI_RATE_LIMIT' and first.value.wait==12
+    with pytest.raises(m.ProviderFailure) as second:m._chat_sync(user('عامل ايه'))
+    assert second.value.kind=='shared_cooldown' and second.value.wait>=11
+    assert len(called)==1
+
+
+def test_chat_http_returns_structured_rate_limit(monkeypatch):
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(m,'GROQ_API_KEY','test')
+    def hit_limit(payload): raise m.ProviderFailure('AI_RATE_LIMIT',status=429,wait=17,kind='quota')
+    monkeypatch.setattr(m,'_chat_sync',hit_limit)
+    with TestClient(m.app) as client:
+        r=client.post('/api/chat',json={'messages':[{'role':'user','content':'هلا'}]})
+    assert r.status_code==429 and r.json()['retry_after_seconds']==17
+    assert 'test' not in str(r.json())

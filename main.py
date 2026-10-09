@@ -5,6 +5,7 @@ Groq JSON completion, validated actions/context, then storefront execution.
 Shopify's read-only live data cache is the sole additional server capability.
 """
 import asyncio
+import math
 import json
 import logging
 import os
@@ -22,17 +23,23 @@ from fastapi.responses import JSONResponse
 from groq import Groq
 from pydantic import BaseModel, Field
 
-SERVICE = "philia-alf-architecture-v31.1"
-VERSION = "31.1.0"
+SERVICE = "philia-alf-architecture-v31.2"
+VERSION = "31.2.0"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 PRIMARY_MODEL = os.getenv("GROQ_MODEL", "").strip() or "openai/gpt-oss-20b"
 FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "").strip()
+# The exact ALF V4.3 fallback order, after any explicitly configured model.
+# Fall back for transient provider/model failures, NOT for exhausted Groq quotas.
+DEFAULT_MODEL_FALLBACKS = ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
+GROQ_MAX_RETRIES = max(0, min(2, int(os.getenv("GROQ_MAX_RETRIES", "2"))))
+GROQ_TIMEOUT = max(10, min(60, int(os.getenv("GROQ_TIMEOUT_SECONDS", "30"))))
+GROQ_REQUEST_TIMEOUT = max(40, min(150, int(os.getenv("CHAT_TIMEOUT_SECONDS", "85"))))
 STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "").strip().removeprefix("https://").rstrip("/")
 SHOPIFY_TOKEN = os.getenv("SHOPIFY_STOREFRONT_PRIVATE_TOKEN", "").strip()
 API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-10").strip()
 CATALOG_TTL = max(60, int(os.getenv("CATALOG_TTL_SECONDS", "300")))
 PAGES_TTL = max(300, int(os.getenv("PAGES_TTL_SECONDS", "3600")))
-MAX_OUTPUT = max(500, min(1600, int(os.getenv("GROQ_MAX_OUTPUT_TOKENS", "1100"))))
+MAX_OUTPUT = max(500, min(1600, int(os.getenv("GROQ_MAX_OUTPUT_TOKENS", "1400"))))
 
 log = logging.getLogger("philia-ai")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -467,8 +474,8 @@ def _sanitize_result(data: Any, catalog: dict, payload: ChatPayload) -> dict:
 
 
 def _models() -> list:
-    # Same ALF primary + optional fallback model strategy; avoid multiplying 429 usage.
-    return list(dict.fromkeys(x for x in [PRIMARY_MODEL, FALLBACK_MODEL] if x))
+    # Copy ALF's fallback ordering, with the optional configured fallback first.
+    return list(dict.fromkeys(x.strip() for x in [PRIMARY_MODEL, FALLBACK_MODEL, *DEFAULT_MODEL_FALLBACKS] if x and x.strip()))
 
 
 def _completion_for_model(client: Groq, model: str, messages: list):
@@ -476,7 +483,67 @@ def _completion_for_model(client: Groq, model: str, messages: list):
                    max_completion_tokens=MAX_OUTPUT, response_format={"type": "json_object"})
     if model.startswith("openai/gpt-oss-"):
         options.update(reasoning_effort="low", reasoning_format="hidden")
+    elif model == "qwen/qwen3.8-27b":
+        options.update(reasoning_effort="none", reasoning_format="hidden")
     return client.chat.completions.create(**options)
+
+
+class ProviderFailure(Exception):
+    def __init__(self, code, status=503, wait=0, kind="provider_failure"):
+        self.code, self.status, self.wait, self.kind = code, status, wait, kind
+        super().__init__(code)
+
+
+# One shared cooldown for this Render process; never sleep inside a chat request.
+_provider_quota_lock = threading.Lock()
+_provider_quota_until = 0.0
+
+
+def _quota_wait():
+    with _provider_quota_lock:
+        return max(0, int(math.ceil(_provider_quota_until - time.monotonic())))
+
+
+def _set_quota_wait(seconds):
+    global _provider_quota_until
+    with _provider_quota_lock:
+        _provider_quota_until = max(_provider_quota_until, time.monotonic() + min(max(1, seconds), 120))
+
+
+def _provider_retry_seconds(exc):
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    try:
+        retry = float(headers.get("retry-after") or 0)
+        if retry > 0:
+            return max(1, int(math.ceil(retry)))
+    except (TypeError, ValueError):
+        pass
+    # Response reset value is a hint, not guaranteed; retain it only for UI.
+    value = str(headers.get("x-ratelimit-reset-tokens") or "").strip()
+    m = re.fullmatch(r"(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?", value)
+    if m and (m.group(1) or m.group(2)):
+        return max(1, math.ceil(float(m.group(1) or 0) * 60 + float(m.group(2) or 0)))
+    return 0
+
+
+def _provider_error(exc):
+    status = getattr(exc, "status_code", None)
+    # Groq SDK uses RateLimitError for 429, including status-less nested failures.
+    name = type(exc).__name__
+    if status == 429 or name == "RateLimitError":
+        return ProviderFailure("AI_RATE_LIMIT", status=429, wait=_provider_retry_seconds(exc), kind="quota")
+    if status in (401, 403):
+        return ProviderFailure("AI_CONFIGURATION_ERROR", status=503, kind="credentials")
+    if status == 400 and "model" in str(exc).lower():
+        return ProviderFailure("AI_MODEL_ERROR", status=503, kind="model_rejected")
+    if name in ("APITimeoutError", "TimeoutException", "TimeoutError"):
+        return ProviderFailure("AI_TIMEOUT", status=504, kind="timeout")
+    if name in ("APIConnectionError", "ConnectError", "ReadError"):
+        return ProviderFailure("AI_CONNECTION_FAILED", status=503, kind="network")
+    if isinstance(exc, (ValueError, json.JSONDecodeError)):
+        return ProviderFailure("AI_BAD_OUTPUT", status=502, kind="invalid_json")
+    return ProviderFailure("AI_PROVIDER_ERROR", status=503, kind="provider_failure")
 
 
 def _extract_confirmed_form_fields(client: Groq, model: str, payload: ChatPayload, form: str) -> dict:
@@ -501,12 +568,13 @@ def _extract_confirmed_form_fields(client: Groq, model: str, payload: ChatPayloa
 
 def _chat_sync(payload: ChatPayload) -> dict:
     if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_NOT_CONFIGURED")
+        raise ProviderFailure("AI_NOT_CONFIGURED", kind="missing_key")
+    remaining = _quota_wait()
+    if remaining:
+        raise ProviderFailure("AI_RATE_LIMIT", status=429, wait=remaining, kind="shared_cooldown")
     started = time.perf_counter()
-    latest = _last_user(payload)
-    # Do not wait for Shopify on greetings: it loads asynchronously when server starts.
-    # Retrieval hint may use conversation history so a short "وريني" retains
-    # the flowers/products subject without treating it as a text-answer router.
+    request_id = str(uuid.uuid4())
+    log.info(json.dumps({"event":"request_received", "request_id": request_id}))
     recent_topic = " ".join(m.content for m in payload.messages[-8:] if m.role == "user")
     needs_catalog = _needs_catalog(recent_topic, payload.context.get("memory") or {})
     catalog, cache_status = CATALOG.get(wait=needs_catalog)
@@ -514,16 +582,19 @@ def _chat_sync(payload: ChatPayload) -> dict:
     catalog = catalog or {"products": [], "collections": []}
     conversation = _conversation(payload, catalog, pages or [])
     history_ms = round((time.perf_counter() - started) * 1000)
-    # Product decisions are never based on imagined catalog if Shopify is unavailable.
-    client = Groq(api_key=GROQ_API_KEY, max_retries=0, timeout=25)
-    failures = []
+    prompt_characters = sum(len(m["content"]) for m in conversation)
+    # Like ALF, reuse the SDK's bounded retry policy and full JSON completion.
+    client = Groq(api_key=GROQ_API_KEY, max_retries=GROQ_MAX_RETRIES, timeout=GROQ_TIMEOUT)
+    errors = []
     for model in _models():
         llm_start = time.perf_counter()
+        log.info(json.dumps({"event": "groq_request_start", "request_id": request_id,
+                             "model": model, "input_characters": prompt_characters,
+                             "history_messages": len(payload.messages), "cache": cache_status}))
         try:
             response = _completion_for_model(client, model, conversation)
             output = _sanitize_result(_extract_json(response.choices[0].message.content or ""), catalog, payload)
-            # Mirror ALF's SECOND, optional confirmed-details extractor only on
-            # explicitly offered autofill buttons, never on normal messages.
+            # Extra extraction is ALF's dedicated form step; zero on ordinary messages.
             form_actions = [a for a in output["actions"] if a["action"] == "form_patch"]
             extractor_calls = 0
             for action in form_actions[:1]:
@@ -532,23 +603,32 @@ def _chat_sync(payload: ChatPayload) -> dict:
                     extracted = _extract_confirmed_form_fields(client, model, payload, action["form"])
                     if extracted:
                         action["fields"].update(extracted)
-                except Exception:
-                    log.warning("confirmed_form_extraction_failed")
-            total_ms = round((time.perf_counter() - started) * 1000)
+                except Exception as exc:
+                    log.warning(json.dumps({"event": "form_extraction_failed", "request_id": request_id,
+                                            "reason": type(exc).__name__}))
             usage = getattr(response, "usage", None)
-            log.info(json.dumps({"event": "request_complete", "model": model, "site_cache": cache_status,
-                                 "history_site_context_ms": history_ms, "llm_total_ms": round((time.perf_counter()-llm_start)*1000),
-                                 "total_ms": total_ms, "llm_calls": len(failures) + 1 + extractor_calls,
+            log.info(json.dumps({"event": "request_complete", "request_id": request_id,
+                                 "model": model, "cache": cache_status,
+                                 "site_context_ms": history_ms, "groq_total_ms": round((time.perf_counter()-llm_start)*1000),
+                                 "total_ms": round((time.perf_counter()-started)*1000),
+                                 "llm_calls": len(errors)+1+extractor_calls,
                                  "prompt_tokens": getattr(usage, "prompt_tokens", None),
                                  "completion_tokens": getattr(usage, "completion_tokens", None)}, default=str))
             return output
         except Exception as exc:
-            status = getattr(exc, "status_code", None)
-            log.warning(json.dumps({"event": "provider_error", "status": status, "exception_type": exc.__class__.__name__}))
-            if status == 429:
-                raise
-            failures.append(exc)
-    raise RuntimeError("GROQ_OR_INVALID_OUTPUT") from failures[-1]
+            failure = _provider_error(exc)
+            log.warning(json.dumps({"event": "provider_error", "request_id": request_id, "model": model,
+                                    "code": failure.code, "reason": failure.kind,
+                                    "provider_status": getattr(exc, "status_code", None),
+                                    "retry_after_seconds": failure.wait}))
+            if failure.code in ("AI_RATE_LIMIT", "AI_CONFIGURATION_ERROR"):
+                if failure.code == "AI_RATE_LIMIT":
+                    _set_quota_wait(failure.wait or 10)
+                raise failure from exc
+            errors.append(failure)
+    log.error(json.dumps({"event": "request_failed", "request_id": request_id,
+                          "models_tried": len(errors), "last_error": errors[-1].code if errors else "none"}))
+    raise errors[-1] if errors else ProviderFailure("AI_PROVIDER_ERROR")
 
 
 @app.on_event("startup")
@@ -567,9 +647,10 @@ def root():
 def health():
     CATALOG.get(False)
     PAGES.get(False)
-    return {"ok": True, "version": VERSION, "service": SERVICE, "provider": "Groq", "configured_model": PRIMARY_MODEL,
+    return {"ok": True, "version": VERSION, "service": SERVICE, "provider": "Groq", "configured_model": PRIMARY_MODEL, "fallback_models": _models()[1:],
             "api_key_configured": bool(GROQ_API_KEY), "shopify_configured": bool(STORE_DOMAIN and SHOPIFY_TOKEN),
             "normal_llm_calls": 1, "response_format": "ALF-style-JSON", "streaming": False,
+            "retry_after_seconds": _quota_wait() or None,
             "catalog_cached": CATALOG.value is not None}
 
 
@@ -609,24 +690,17 @@ async def action_result(request: Request):
 
 @app.post("/api/chat")
 async def chat(payload: ChatPayload):
+    if not payload.messages or payload.messages[-1].role != "user":
+        return JSONResponse({"error": "INVALID_MESSAGES", "code": "INVALID_MESSAGES"}, status_code=400)
     try:
-        if not payload.messages or payload.messages[-1].role != "user":
-            return JSONResponse({"error": "INVALID_MESSAGES"}, status_code=400)
-        result = await asyncio.wait_for(asyncio.to_thread(_chat_sync, payload), timeout=45)
+        result = await asyncio.wait_for(asyncio.to_thread(_chat_sync, payload), timeout=GROQ_REQUEST_TIMEOUT)
         return JSONResponse(result)
     except asyncio.TimeoutError:
-        return JSONResponse({"error": "AI_TIMEOUT"}, status_code=504)
+        return JSONResponse({"error": "AI_TIMEOUT", "code": "AI_TIMEOUT"}, status_code=504)
     except Exception as exc:
-        status = getattr(exc, "status_code", None)
-        if status == 429:
-            wait = 0
-            # User-safe retry delay from provider, no private key/log leakage.
-            h = getattr(exc, "response", None)
-            try:
-                wait = max(0, min(86400, int(float((h.headers or {}).get("retry-after", 0))))) if h else 0
-            except (ValueError, TypeError):
-                pass
-            return JSONResponse({"error": "AI_RATE_LIMIT", "code": "AI_RATE_LIMIT",
-                                 "retry_after_seconds": wait or None}, status_code=429)
-        log.error("chat_request_failed type=%s", exc.__class__.__name__)
-        return JSONResponse({"error": "AI_CONNECTION_FAILED", "code": "AI_CONNECTION_FAILED"}, status_code=503)
+        failure = exc if isinstance(exc, ProviderFailure) else _provider_error(exc)
+        log.error(json.dumps({"event": "chat_request_failed", "code": failure.code,
+                              "reason": failure.kind, "status": failure.status}))
+        return JSONResponse({"error": failure.code, "code": failure.code,
+                             "retry_after_seconds": failure.wait or None},
+                            status_code=failure.status)
