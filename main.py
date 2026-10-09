@@ -3,6 +3,7 @@ import os
 import re
 import json
 import asyncio
+import ast
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Request
@@ -11,8 +12,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from groq import Groq
 
-SERVICE = "philia-alf-exact-agent-v32"
-VERSION = "32.0.0"
+SERVICE = "philia-alf-exact-agent-v32.1"
+VERSION = "32.1.0"
 
 # This is ALF's unmodified provider/model selection, retry policy, JSON contract,
 # 85-second request timeout, and 40-message conversation architecture.
@@ -228,6 +229,87 @@ def _sanitize_result(data: Any) -> Dict[str, Any]:
         elif isinstance(v,dict): clean_ctx[str(k)[:80]]=dict(list(v.items())[:20])
     return {"reply":reply, "actions":actions,"auto_action":auto,"context":clean_ctx}
 
+def _failed_generation_from_exception(exc: Exception) -> str:
+    """Recover Groq's already-generated text from json_validate_failed errors.
+
+    Groq JSON Object Mode can occasionally reject a useful natural-language
+    generation with HTTP 400 and include that exact generation in
+    error.failed_generation. Reusing it prevents a second model call and avoids
+    wasting TPM on a fallback for a response we already have.
+    """
+    bodies: List[Any] = []
+    body = getattr(exc, "body", None)
+    if body is not None:
+        bodies.append(body)
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            bodies.append(response.json())
+        except Exception:
+            pass
+    for data in bodies:
+        if not isinstance(data, dict):
+            continue
+        err = data.get("error") if isinstance(data.get("error"), dict) else data
+        failed = err.get("failed_generation") if isinstance(err, dict) else None
+        code = str(err.get("code") or "") if isinstance(err, dict) else ""
+        if failed and (not code or code == "json_validate_failed"):
+            return str(failed).strip()
+
+    # SDK versions may expose only the printable error text. Safely parse the
+    # dict after "Error code: N - " rather than regex-unescaping user content.
+    raw = str(exc)
+    marker = " - "
+    if marker in raw:
+        try:
+            parsed = ast.literal_eval(raw.split(marker, 1)[1])
+            if isinstance(parsed, dict):
+                err = parsed.get("error") if isinstance(parsed.get("error"), dict) else parsed
+                failed = err.get("failed_generation") if isinstance(err, dict) else None
+                code = str(err.get("code") or "") if isinstance(err, dict) else ""
+                if failed and (not code or code == "json_validate_failed"):
+                    return str(failed).strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _last_user_text(payload: ChatPayload) -> str:
+    return next((str(m.content or "").strip().lower() for m in reversed(payload.messages) if m.role == "user"), "")
+
+
+def _needs_structured_action(payload: ChatPayload) -> bool:
+    """Only safety fallback logic; normal conversation still goes directly to ALF LLM."""
+    text = _last_user_text(payload)
+    if not text:
+        return False
+    return bool(re.search(
+        r"(?:add|buy|purchase|cart|bag|open|take me|go to|navigate|fill|prepare|whatsapp|"
+        r"ضيف|اضف|أضف|اشتري|السلة|السله|افتح|وديني|روح|جهز|املأ|املا|واتساب)",
+        text, re.I,
+    ))
+
+
+def _recover_json_failure(exc: Exception, payload: ChatPayload) -> Optional[Dict[str, Any]]:
+    failed = _failed_generation_from_exception(exc)
+    if not failed:
+        return None
+    # If Groq actually generated JSON, preserve ALF's full action contract.
+    try:
+        return _sanitize_result(_extract_json(failed))
+    except Exception:
+        pass
+    # For ordinary conversation, the generated text is already the user-facing
+    # answer. Do not burn a second model call just because JSON mode rejected it.
+    # Explicit website mutations/navigation still require structured metadata.
+    if _needs_structured_action(payload):
+        return None
+    clean = failed.strip()
+    if not clean:
+        return None
+    return {"reply": clean[:8000], "actions": [], "auto_action": None, "context": {}}
+
+
 def _models() -> List[str]:
     candidates = [PRIMARY_MODEL]
     if CONFIGURED_FALLBACK:
@@ -322,6 +404,11 @@ def _chat_sync(payload: ChatPayload) -> Dict[str, Any]:
             result["_model"] = model
             return result
         except Exception as exc:
+            recovered = _recover_json_failure(exc, payload)
+            if recovered is not None:
+                print(f"[PHILIA ALF engine] recovered Groq failed_generation from {model}; no fallback call needed", flush=True)
+                recovered["_model"] = model
+                return recovered
             message = str(exc).replace("\n", " ")[:260]
             errors.append(f"{model}: {message}")
             print(f"[PHILIA ALF engine] model failed {model}: {repr(exc)}", flush=True)
