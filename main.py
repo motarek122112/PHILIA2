@@ -22,8 +22,8 @@ from fastapi.responses import JSONResponse
 from groq import Groq
 from pydantic import BaseModel, Field
 
-SERVICE = "philia-alf-architecture-v31"
-VERSION = "31.0.0"
+SERVICE = "philia-alf-architecture-v31.1"
+VERSION = "31.1.0"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 PRIMARY_MODEL = os.getenv("GROQ_MODEL", "").strip() or "openai/gpt-oss-20b"
 FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "").strip()

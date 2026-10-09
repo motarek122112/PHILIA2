@@ -1,10 +1,10 @@
-# Philia Flowers AI — ALF Uniforms V4.3 Architecture Adaptation (V31)
+# Philia Flowers AI — ALF Uniforms V4.3 Architecture Adaptation (V31.1 / PHILIA2)
 
 This is a *real FastAPI/Groq backend adapted from the ALF architectural flow*, with **Philia-specific website knowledge**, Shopify product data, and Philia actions. It replaces Philia's Node.js LLM pipeline; it does not copy ALF uniform content.
 
 ## Architecture
 
-Visitor -> Philia Theme V117 `assets/theme.js` -> POST `/api/chat` -> FastAPI Pydantic `ChatPayload` -> last 40 messages plus saved session context -> compact **live Shopify catalog cache** -> **one** Groq chat completion in `response_format=json_object` -> validated Philia JSON (`reply, actions, auto_action, context, products`) -> Philia frontend real action execution -> Shopify/cart/DOM verification.
+Visitor -> Philia Theme V118 `assets/theme.js` -> POST `/api/chat` -> FastAPI Pydantic `ChatPayload` -> last 40 messages plus saved session context -> compact **live Shopify catalog cache** -> **one** Groq chat completion in `response_format=json_object` -> validated Philia JSON (`reply, actions, auto_action, context, products`) -> Philia frontend real action execution -> Shopify/cart/DOM verification.
 
 - Matching ALF: Python FastAPI, Groq SDK, full JSON responses (not streamed), one model completion for normal chat, optional second confirmed-details extraction **only for form autofill**; clean, short English/Arabic reply style, dynamic suggested buttons, persistent frontend history.
 - Philia-specific extensions: genuine Shopify catalog/collections and page data cached on the backend, genuine product cards, verified Shopify add/remove/change cart requests in theme, consent gates, product price check, exact contact/bespoke/events/corporate form maps.
@@ -13,13 +13,13 @@ Visitor -> Philia Theme V117 `assets/theme.js` -> POST `/api/chat` -> FastAPI Py
 
 ## IMPORTANT: Render deployment changes
 
-ALF uses **Python**, unlike Philia V30.2 on **Node.js**. **Do not just upload these files to the current Node Render service expecting `npm start` to work.**
+ALF uses **Python**, unlike Philia V30.2 on **Node.js**. **This release targets the existing Python service PHILIA2 at https://philia2.onrender.com. Do not use the old Node Render backend URL.**
 
-Safest migration: keep the current Node service unchanged while testing a second Render **Python Web Service** from this GitHub repo/branch. In the new service set:
+GitHub repository: `motarek122112/PHILIA2`, branch `main`. The service is already created; keep using that Python Render Web Service. For redeploys, use:
 
 - Runtime: Python
 - Build Command: `pip install -r requirements.txt`
-- Start Command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+- Start Command: `python -m uvicorn main:app --host 0.0.0.0 --port $PORT`
 - Health Check Path: `/health`
 - Environment: copy your existing `GROQ_API_KEY`, `SHOPIFY_STORE_DOMAIN`, `SHOPIFY_STOREFRONT_PRIVATE_TOKEN`, and `SHOPIFY_API_VERSION`, using Render's protected environment settings.
 - Set `GROQ_MODEL=openai/gpt-oss-20b` if you want **the same ALF default model**. Your recent Philia logs showed 120B configured; merely uploading the ZIP does not override `GROQ_MODEL` in Render.
@@ -27,7 +27,7 @@ Safest migration: keep the current Node service unchanged while testing a second
 
 Do not upload `.env`/live API keys to GitHub. `.env.example` is only an example.
 
-In Shopify Admin, upload **Theme V117** as unpublished theme, then in **Customize -> Theme settings -> AI backend endpoint** set your **new Python Render service URL** (root URL, not necessarily `/api/chat`). Test the unpublished theme before switching live. Old V116 + Node v30.2 remain your rollback path.
+In Shopify Admin, upload **Theme V118** as unpublished theme, then in **Customize -> Theme settings -> AI backend endpoint** set your **new Python Render service URL** (root URL, not necessarily `/api/chat`). Test the unpublished theme before switching live. Old V116 + Node v30.2 remain your rollback path.
 
 ## Endpoints
 
@@ -48,3 +48,16 @@ Tests use a **fake Groq transport and offline Shopify fixture**, not live provid
 This migration intentionally changes Philia's real streaming to **ALF-style completed JSON**, to match ALF's response architecture. Display speed on Render depends on cold starts, Groq availability, model setting, prompt size, and quotas; identical numerical latency is not guaranteed by code alone. Rate-limit 429 cannot be eliminated at the account level by software.
 
 No checkout or form submission is automatic, and no service availability is invented. Verified Shopify cart mutations still happen in the browser and are not claimed complete until the cart endpoint responds and the updated cart is verified. Product cards only use handles found in cached actual Shopify data.
+
+
+## PHILIA2 deployment and integration (2026-10-09)
+
+- GitHub: https://github.com/motarek122112/PHILIA2 (not the previous `philia-ai-backend` repository).
+- Render service root: `https://philia2.onrender.com`
+- Chat API: `https://philia2.onrender.com/api/chat`
+- Health: `https://philia2.onrender.com/health`; expect `version` `31.1.0` once this updated code is deployed.
+- Shopify theme: **Philia Flowers V118 PHILIA2**, which explicitly sets the AI backend endpoint to the new Render URL in `config/settings_data.json` and its code fallback.
+- Backend keeps ALF-style single Groq JSON response; not streaming.
+- `GROQ_API_KEY` and `SHOPIFY_STOREFRONT_PRIVATE_TOKEN` must be configured in Render Environment, never committed to GitHub.
+- `render.yaml` is a Blueprint template; a manually created existing Render service uses its own service configuration.
+- No repository commits and no live Render changes are performed just by downloading this ZIP.
