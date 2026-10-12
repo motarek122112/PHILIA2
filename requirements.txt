@@ -3,3 +3,6 @@ uvicorn[standard]>=0.32
 gunicorn>=23
 groq>=0.31
 pydantic>=2.9
+sqlalchemy>=2.0
+psycopg[binary]>=3.2
+httpx>=0.28
