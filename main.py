@@ -609,12 +609,12 @@ async def chat(payload: ChatPayload, request: Request):
         }, status_code=503)
 
 
-# Philia V33 request/account/admin system — isolated from the AI engine.
-from briefs_system import router as briefs_router, init_brief_db
+# Philia V34 Shopify-native request/account system — isolated from the AI engine.
+from briefs_system import router as briefs_router, init_brief_store
 app.include_router(briefs_router)
 # Shopify App Proxy should point /apps/philia-briefs to this /proxy prefix.
 app.include_router(briefs_router, prefix="/proxy")
 
 @app.on_event("startup")
 def _init_philia_briefs():
-    init_brief_db()
+    init_brief_store()

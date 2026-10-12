@@ -1,26 +1,18 @@
-import os, re, hmac, hashlib, secrets, smtplib, json, csv, io, html
-from datetime import datetime, timezone, timedelta, date
+import os, re, hmac, hashlib, secrets, smtplib, json, html, time
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from typing import Optional, Dict, Any, List
-from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
-
-try:
-    from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Date, Boolean, Numeric, select, or_, func
-    from sqlalchemy.orm import declarative_base, sessionmaker
-    SQLALCHEMY_OK = True
-except Exception:
-    SQLALCHEMY_OK = False
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
 
 router = APIRouter()
-DATABASE_URL = os.getenv('DATABASE_URL','').strip()
-SHOPIFY_API_SECRET = os.getenv('SHOPIFY_API_SECRET','').strip()
-SHOPIFY_STORE_DOMAIN = os.getenv('SHOPIFY_STORE_DOMAIN','').strip().replace('https://','').strip('/')
-SHOPIFY_ADMIN_TOKEN = os.getenv('SHOPIFY_ADMIN_TOKEN','').strip()
+
+SHOPIFY_SHOP = os.getenv('SHOPIFY_SHOP','').strip().replace('https://','').replace('.myshopify.com','').strip('/')
+SHOPIFY_CLIENT_ID = os.getenv('SHOPIFY_CLIENT_ID','').strip()
+SHOPIFY_CLIENT_SECRET = os.getenv('SHOPIFY_CLIENT_SECRET','').strip()
 SHOPIFY_ADMIN_API_VERSION = os.getenv('SHOPIFY_ADMIN_API_VERSION','2026-10').strip()
 PHILIA_NOTIFICATION_EMAIL = os.getenv('PHILIA_NOTIFICATION_EMAIL','').strip()
 SMTP_HOST = os.getenv('SMTP_HOST','').strip()
@@ -30,64 +22,12 @@ SMTP_PASSWORD = os.getenv('SMTP_PASSWORD','').strip()
 SMTP_FROM = os.getenv('SMTP_FROM_EMAIL','').strip() or SMTP_USER or PHILIA_NOTIFICATION_EMAIL
 ADMIN_DASHBOARD_USER = os.getenv('ADMIN_DASHBOARD_USER','philia').strip() or 'philia'
 ADMIN_DASHBOARD_PASSWORD = os.getenv('ADMIN_DASHBOARD_PASSWORD','').strip()
-ADMIN_SESSION_SECRET = os.getenv('ADMIN_SESSION_SECRET','').strip() or SHOPIFY_API_SECRET or secrets.token_hex(32)
-CRON_SECRET = os.getenv('CRON_SECRET','').strip()
+ADMIN_SESSION_SECRET = os.getenv('ADMIN_SESSION_SECRET','').strip() or SHOPIFY_CLIENT_SECRET or secrets.token_hex(32)
 ALLOW_UNSIGNED_PROXY = os.getenv('ALLOW_UNSIGNED_PROXY','false').lower() in {'1','true','yes'}
 
-Base = declarative_base() if SQLALCHEMY_OK else object
-_engine = None
-SessionLocal = None
-DB_ERROR = None
-
-if SQLALCHEMY_OK and DATABASE_URL:
-    try:
-        _engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
-        SessionLocal = sessionmaker(bind=_engine, autoflush=False, expire_on_commit=False, future=True)
-    except Exception as e:
-        DB_ERROR = repr(e)
-else:
-    DB_ERROR = 'DATABASE_URL missing' if not DATABASE_URL else 'SQLAlchemy unavailable'
-
-if SQLALCHEMY_OK:
-    class Brief(Base):
-        __tablename__ = 'philia_briefs'
-        id = Column(Integer, primary_key=True)
-        reference = Column(String(40), unique=True, nullable=False, index=True)
-        request_type = Column(String(32), nullable=False, index=True)
-        status = Column(String(24), nullable=False, default='submitted', index=True)
-        customer_id = Column(String(64), nullable=True, index=True)
-        customer_email = Column(String(320), nullable=False, index=True)
-        customer_name = Column(String(180), nullable=False)
-        phone = Column(String(80), nullable=True)
-        event_date = Column(Date, nullable=True, index=True)
-        guest_count = Column(Integer, nullable=True)
-        venue = Column(String(300), nullable=True)
-        budget = Column(String(180), nullable=True)
-        occasion = Column(String(240), nullable=True)
-        colours = Column(String(300), nullable=True)
-        company = Column(String(240), nullable=True)
-        quantity_scope = Column(String(300), nullable=True)
-        details = Column(Text, nullable=False)
-        quote_amount_kwd = Column(Numeric(12,3), nullable=True)
-        internal_note = Column(Text, nullable=True)
-        cancellation_reason = Column(Text, nullable=True)
-        manage_token_hash = Column(String(64), nullable=False)
-        shopify_draft_order_id = Column(String(120), nullable=True)
-        shopify_draft_order_name = Column(String(80), nullable=True)
-        created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
-        updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
-        cancelled_at = Column(DateTime(timezone=True), nullable=True)
-        last_customer_edit_at = Column(DateTime(timezone=True), nullable=True)
-
-    class BriefAudit(Base):
-        __tablename__ = 'philia_brief_audit'
-        id = Column(Integer, primary_key=True)
-        brief_id = Column(Integer, nullable=False, index=True)
-        reference = Column(String(40), nullable=False, index=True)
-        actor = Column(String(80), nullable=False)
-        action = Column(String(80), nullable=False)
-        payload_json = Column(Text, nullable=True)
-        created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+META_TYPE = '$app:philia_request'
+_token_cache = {'token':'','expires_at':0.0}
+_definition_ready = False
 
 class BriefCreate(BaseModel):
     request_type: str
@@ -120,158 +60,259 @@ class BriefUpdate(BaseModel):
 class CancelPayload(BaseModel):
     reason: Optional[str] = None
 
-class AdminLogin(BaseModel):
-    username: str
-    password: str
-
-class AdminUpdate(BaseModel):
-    status: Optional[str] = None
-    quote_amount_kwd: Optional[float] = None
-    internal_note: Optional[str] = None
-
 VALID_TYPES = {'event','bespoke','corporate'}
-VALID_STATUSES = {'submitted','in_review','quoted','confirmed','completed','cancelled'}
+EDITABLE_STATUSES = {'submitted','in_review','quoted','confirmed'}
+
+FIELD_DEFS = [
+    ('Reference','reference','single_line_text_field'),
+    ('Request type','request_type','single_line_text_field'),
+    ('Status','status','single_line_text_field'),
+    ('Customer ID','customer_id','single_line_text_field'),
+    ('Customer email','customer_email','single_line_text_field'),
+    ('Customer name','customer_name','single_line_text_field'),
+    ('Phone','phone','single_line_text_field'),
+    ('Event date','event_date','date'),
+    ('Guest count','guest_count','number_integer'),
+    ('Venue','venue','single_line_text_field'),
+    ('Budget','budget','single_line_text_field'),
+    ('Occasion','occasion','single_line_text_field'),
+    ('Colours','colours','single_line_text_field'),
+    ('Company','company','single_line_text_field'),
+    ('Quantity / scope','quantity_scope','single_line_text_field'),
+    ('Details','details','multi_line_text_field'),
+    ('Quote amount KWD','quote_amount_kwd','number_decimal'),
+    ('Internal note','internal_note','multi_line_text_field'),
+    ('Cancellation reason','cancellation_reason','multi_line_text_field'),
+    ('Draft order ID','shopify_draft_order_id','single_line_text_field'),
+    ('Draft order name','shopify_draft_order_name','single_line_text_field'),
+    ('Created at','created_at','date_time'),
+    ('Updated at','updated_at','date_time'),
+    ('Cancelled at','cancelled_at','date_time'),
+    ('Last customer edit at','last_customer_edit_at','date_time'),
+    ('Audit history','audit_history','json'),
+]
 
 
-def init_brief_db():
-    global DB_ERROR
-    if not _engine or not SQLALCHEMY_OK:
-        return
-    try:
-        Base.metadata.create_all(bind=_engine)
-        DB_ERROR = None
-    except Exception as e:
-        DB_ERROR = repr(e)
-        print('[PHILIA BRIEFS] DB init failed', DB_ERROR, flush=True)
-
-
-def _require_db():
-    if not SessionLocal:
-        raise HTTPException(503, 'Event brief database is not configured yet.')
-
-
-def _now(): return datetime.now(timezone.utc)
-
-def _date(v: Optional[str]):
-    if not v: return None
-    try: return date.fromisoformat(v[:10])
-    except Exception: raise HTTPException(422, 'Invalid date')
+def _now():
+    return datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
 
 def _clean(v, n=500):
     if v is None: return None
-    return str(v).strip()[:n]
-
-def _hash_token(token: str): return hashlib.sha256(token.encode()).hexdigest()
+    s=str(v).strip()
+    return s[:n] if s else None
 
 def _reference(kind: str):
-    prefix = {'event':'EV','bespoke':'BQ','corporate':'CO'}.get(kind,'RQ')
+    prefix={'event':'EV','bespoke':'BQ','corporate':'CO'}.get(kind,'RQ')
     return f"PH-{prefix}-{datetime.now().strftime('%y%m%d')}-{secrets.token_hex(2).upper()}"
 
+def _handle(ref:str):
+    return re.sub(r'[^a-z0-9-]+','-',ref.lower()).strip('-')
 
-def _audit(db, brief, actor, action, payload=None):
-    db.add(BriefAudit(brief_id=brief.id, reference=brief.reference, actor=actor, action=action,
-                      payload_json=json.dumps(payload or {}, ensure_ascii=False, default=str)[:12000]))
+def _shop_domain():
+    if not SHOPIFY_SHOP: raise HTTPException(503,'SHOPIFY_SHOP is not configured.')
+    return f'{SHOPIFY_SHOP}.myshopify.com'
 
+def _access_token(force=False):
+    now=time.time()
+    if not force and _token_cache['token'] and now < _token_cache['expires_at']-90:
+        return _token_cache['token']
+    if not (SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET):
+        raise HTTPException(503,'Shopify app credentials are not configured.')
+    url=f'https://{_shop_domain()}/admin/oauth/access_token'
+    try:
+        with httpx.Client(timeout=20) as c:
+            r=c.post(url,headers={'Content-Type':'application/x-www-form-urlencoded'},data={
+                'grant_type':'client_credentials','client_id':SHOPIFY_CLIENT_ID,'client_secret':SHOPIFY_CLIENT_SECRET})
+            r.raise_for_status(); data=r.json()
+        token=data.get('access_token'); exp=int(data.get('expires_in') or 86399)
+        if not token: raise RuntimeError('No access_token returned')
+        _token_cache.update(token=token,expires_at=now+exp)
+        return token
+    except Exception as e:
+        raise HTTPException(503,f'Shopify authentication failed: {str(e)[:180]}')
 
-def _serialize(b, admin=False):
-    data = {
-        'reference':b.reference,'request_type':b.request_type,'status':b.status,
-        'name':b.customer_name,'email':b.customer_email,'phone':b.phone,
-        'event_date':b.event_date.isoformat() if b.event_date else None,'guest_count':b.guest_count,
-        'venue':b.venue,'budget':b.budget,'occasion':b.occasion,'colours':b.colours,
-        'company':b.company,'quantity_scope':b.quantity_scope,'details':b.details,
-        'quote_amount_kwd':float(b.quote_amount_kwd) if b.quote_amount_kwd is not None else None,
-        'created_at':b.created_at.isoformat() if b.created_at else None,
-        'updated_at':b.updated_at.isoformat() if b.updated_at else None,
-        'cancelled_at':b.cancelled_at.isoformat() if b.cancelled_at else None,
-        'shopify_draft_order_name':b.shopify_draft_order_name,
+def _gql(query:str, variables:Optional[Dict[str,Any]]=None):
+    url=f'https://{_shop_domain()}/admin/api/{SHOPIFY_ADMIN_API_VERSION}/graphql.json'
+    def call(token):
+        with httpx.Client(timeout=25) as c:
+            return c.post(url,headers={'X-Shopify-Access-Token':token,'Content-Type':'application/json'},json={'query':query,'variables':variables or {}})
+    r=call(_access_token())
+    if r.status_code in (401,403):
+        r=call(_access_token(True))
+    try: data=r.json()
+    except Exception: raise HTTPException(502,'Invalid response from Shopify Admin API.')
+    if r.status_code>=400: raise HTTPException(502,f'Shopify API HTTP {r.status_code}: {str(data)[:500]}')
+    if data.get('errors'): raise HTTPException(502,f"Shopify GraphQL error: {data['errors'][0].get('message','Unknown error')}")
+    return data.get('data') or {}
+
+def _user_errors(payload:Dict[str,Any], key:str):
+    errs=((payload.get(key) or {}).get('userErrors') or [])
+    if errs:
+        msg='; '.join(str(e.get('message') or 'Shopify error') for e in errs[:3])
+        raise HTTPException(422,msg)
+
+def _ensure_definition():
+    global _definition_ready
+    if _definition_ready: return
+    q='query($type:String!){metaobjectDefinitionByType(type:$type){id name type}}'
+    d=_gql(q,{'type':META_TYPE})
+    if d.get('metaobjectDefinitionByType'):
+        _definition_ready=True; return
+    mutation='''mutation($definition:MetaobjectDefinitionCreateInput!){metaobjectDefinitionCreate(definition:$definition){metaobjectDefinition{id type name} userErrors{field message code}}}'''
+    definition={
+        'name':'Philia Requests','type':META_TYPE,'displayNameKey':'reference',
+        'access':{'admin':'MERCHANT_READ_WRITE','storefront':'NONE'},
+        'fieldDefinitions':[{'name':n,'key':k,'type':t} for n,k,t in FIELD_DEFS]
     }
+    d=_gql(mutation,{'definition':definition}); _user_errors(d,'metaobjectDefinitionCreate')
+    _definition_ready=True
+
+def init_brief_store():
+    if not (SHOPIFY_SHOP and SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET):
+        print('[PHILIA REQUESTS] Shopify credentials not complete yet.',flush=True); return
+    try:
+        _ensure_definition(); print('[PHILIA REQUESTS] Shopify Metaobject store ready.',flush=True)
+    except Exception as e:
+        print('[PHILIA REQUESTS] definition init deferred:',repr(e),flush=True)
+
+
+def _fields_to_dict(node:Dict[str,Any]):
+    out={'id':node.get('id'),'handle':node.get('handle')}
+    for f in node.get('fields') or []:
+        out[f.get('key')]=f.get('value')
+    for k in ('guest_count',):
+        if out.get(k) not in (None,''):
+            try: out[k]=int(float(out[k]))
+            except Exception: pass
+    if out.get('quote_amount_kwd') not in (None,''):
+        try: out['quote_amount_kwd']=float(out['quote_amount_kwd'])
+        except Exception: pass
+    for k in ('audit_history',):
+        try: out[k]=json.loads(out.get(k) or '[]')
+        except Exception: out[k]=[]
+    return out
+
+def _serialize(d:Dict[str,Any], admin=False):
+    keys=['reference','request_type','status','customer_email','customer_name','phone','event_date','guest_count','venue','budget','occasion','colours','company','quantity_scope','details','quote_amount_kwd','created_at','updated_at','cancelled_at','shopify_draft_order_name']
+    out={k:d.get(k) for k in keys}
+    out['name']=out.pop('customer_name',None); out['email']=out.pop('customer_email',None)
     if admin:
-        data.update({'customer_id':b.customer_id,'internal_note':b.internal_note,'cancellation_reason':b.cancellation_reason,
-                     'shopify_draft_order_id':b.shopify_draft_order_id})
-    return data
+        out.update({k:d.get(k) for k in ['customer_id','internal_note','cancellation_reason','shopify_draft_order_id','audit_history']})
+    return out
+
+def _field_list(d:Dict[str,Any]):
+    vals=[]
+    types={k:t for _,k,t in FIELD_DEFS}
+    typed_nonempty={'event_date','guest_count','quote_amount_kwd','created_at','updated_at','cancelled_at','last_customer_edit_at'}
+    for _,key,_ in FIELD_DEFS:
+        if key not in d: continue
+        v=d.get(key)
+        if key in typed_nonempty and v in (None,''):
+            continue
+        if v is None: v=''
+        if key=='audit_history' and not isinstance(v,str): v=json.dumps(v,ensure_ascii=False,default=str)
+        vals.append({'key':key,'value':str(v)})
+    return vals
+
+def _audit(record:Dict[str,Any], actor:str, action:str, payload=None):
+    arr=list(record.get('audit_history') or [])[-49:]
+    arr.append({'at':_now(),'actor':actor,'action':action,'payload':payload or {}})
+    record['audit_history']=arr
 
 
-def _proxy_signature_ok(request: Request) -> bool:
+def _proxy_signature_ok(request:Request):
     if ALLOW_UNSIGNED_PROXY: return True
-    if not SHOPIFY_API_SECRET: return False
-    supplied = request.query_params.get('signature','')
+    if not SHOPIFY_CLIENT_SECRET: return False
+    supplied=request.query_params.get('signature','')
     if not supplied: return False
-    # Shopify App Proxy canonicalization: group repeated keys with comma-separated
-    # values, build key=value entries, sort the entries, then concatenate them.
-    grouped: Dict[str, List[str]] = {}
+    grouped:Dict[str,List[str]]={}
     for k,v in request.query_params.multi_items():
-        if k == 'signature': continue
-        grouped.setdefault(k, []).append(v)
-    canonical = ''.join(sorted(f"{k}={','.join(values)}" for k,values in grouped.items()))
-    digest = hmac.new(SHOPIFY_API_SECRET.encode(), canonical.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(digest, supplied)
+        if k=='signature': continue
+        grouped.setdefault(k,[]).append(v)
+    canonical=''.join(sorted(f"{k}={','.join(vs)}" for k,vs in grouped.items()))
+    digest=hmac.new(SHOPIFY_CLIENT_SECRET.encode(),canonical.encode(),hashlib.sha256).hexdigest()
+    return hmac.compare_digest(digest,supplied)
+
+def _proxy_identity(request:Request):
+    if not _proxy_signature_ok(request): raise HTTPException(401,'Invalid Shopify app proxy signature.')
+    shop=request.query_params.get('shop','').strip()
+    if shop and shop != _shop_domain(): raise HTTPException(403,'Wrong Shopify store.')
+    return request.query_params.get('logged_in_customer_id','').strip() or None
 
 
-def _proxy_identity(request: Request):
-    if not _proxy_signature_ok(request):
-        raise HTTPException(401, 'Invalid Shopify app proxy signature')
-    shop = request.query_params.get('shop','').strip()
-    if SHOPIFY_STORE_DOMAIN and shop and shop != SHOPIFY_STORE_DOMAIN:
-        raise HTTPException(403, 'Wrong Shopify store')
-    cid = request.query_params.get('logged_in_customer_id','').strip() or None
-    return cid, shop
+def _get_by_handle(handle:str):
+    _ensure_definition()
+    q='''query($handle:MetaobjectHandleInput!){metaobjectByHandle(handle:$handle){id handle fields{key value}}}'''
+    d=_gql(q,{'handle':{'type':META_TYPE,'handle':handle}})
+    node=d.get('metaobjectByHandle')
+    return _fields_to_dict(node) if node else None
+
+def _get_by_reference(ref:str):
+    return _get_by_handle(_handle(ref))
+
+def _all_records(limit=1200):
+    _ensure_definition(); out=[]; after=None
+    q='''query($type:String!,$after:String){metaobjects(type:$type,first:100,after:$after){nodes{id handle fields{key value}} pageInfo{hasNextPage endCursor}}}'''
+    while len(out)<limit:
+        d=_gql(q,{'type':META_TYPE,'after':after}); conn=d.get('metaobjects') or {}
+        out.extend(_fields_to_dict(n) for n in conn.get('nodes') or [])
+        pi=conn.get('pageInfo') or {}
+        if not pi.get('hasNextPage'): break
+        after=pi.get('endCursor')
+        if not after: break
+    return out
+
+def _create_meta(record:Dict[str,Any]):
+    _ensure_definition()
+    q='''mutation($metaobject:MetaobjectCreateInput!){metaobjectCreate(metaobject:$metaobject){metaobject{id handle fields{key value}} userErrors{field message code}}}'''
+    inp={'type':META_TYPE,'handle':_handle(record['reference']),'fields':_field_list(record)}
+    d=_gql(q,{'metaobject':inp}); _user_errors(d,'metaobjectCreate')
+    node=((d.get('metaobjectCreate') or {}).get('metaobject'))
+    if not node: raise HTTPException(502,'Shopify did not create the request record.')
+    return _fields_to_dict(node)
+
+def _update_meta(record:Dict[str,Any]):
+    q='''mutation($id:ID!,$metaobject:MetaobjectUpdateInput!){metaobjectUpdate(id:$id,metaobject:$metaobject){metaobject{id handle fields{key value}} userErrors{field message code}}}'''
+    d=_gql(q,{'id':record['id'],'metaobject':{'fields':_field_list(record)}}); _user_errors(d,'metaobjectUpdate')
+    node=((d.get('metaobjectUpdate') or {}).get('metaobject'))
+    return _fields_to_dict(node) if node else record
 
 
-def _shopify_graphql(query: str, variables: Dict[str,Any]):
-    if not (SHOPIFY_STORE_DOMAIN and SHOPIFY_ADMIN_TOKEN): return None
-    url=f'https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_ADMIN_API_VERSION}/graphql.json'
-    with httpx.Client(timeout=18) as c:
-        r=c.post(url,headers={'X-Shopify-Access-Token':SHOPIFY_ADMIN_TOKEN,'Content-Type':'application/json'},json={'query':query,'variables':variables})
-        r.raise_for_status(); data=r.json()
-        if data.get('errors'): raise RuntimeError(str(data['errors']))
-        return data.get('data')
-
-
-def _customer_email(customer_id: Optional[str]) -> Optional[str]:
-    if not customer_id: return None
-    try:
-        d=_shopify_graphql('query($id:ID!){customer(id:$id){email firstName lastName}}', {'id':f'gid://shopify/Customer/{customer_id}'})
-        return ((d or {}).get('customer') or {}).get('email')
-    except Exception as e:
-        print('[PHILIA BRIEFS] customer lookup failed',repr(e),flush=True); return None
-
-
-def _draft_attrs(b):
-    pairs={
-      'Philia Request Reference':b.reference,'Request Type':b.request_type,'Status':b.status,
-      'Event / Required Date':b.event_date.isoformat() if b.event_date else '', 'Guest Count':b.guest_count or '',
-      'Venue':b.venue or '', 'Budget':b.budget or '', 'Occasion':b.occasion or '', 'Colours':b.colours or '',
-      'Company':b.company or '', 'Quantity / Scope':b.quantity_scope or '', 'Phone':b.phone or ''
+def _draft_input(record:Dict[str,Any]):
+    ref=record.get('reference','Philia request'); status=record.get('status','submitted'); typ=record.get('request_type','request')
+    attrs=[]
+    mapping=[('Philia Reference','reference'),('Request Type','request_type'),('Request Status','status'),('Event Date','event_date'),('Venue','venue'),('Budget','budget'),('Guest Count','guest_count'),('Occasion','occasion'),('Company','company'),('Cancellation Reason','cancellation_reason')]
+    for label,key in mapping:
+        v=record.get(key)
+        if v not in (None,''): attrs.append({'key':label,'value':str(v)[:255]})
+    title=f"Philia {typ.title()} Request — {ref}"
+    return {
+        'email':record.get('customer_email') or None,
+        'note':(record.get('details') or '')[:5000],
+        'tags':['Philia Request',f'Philia:{typ}',f'Philia:{status}',ref],
+        'customAttributes':attrs,
+        'lineItems':[{'title':title[:255],'quantity':1,'originalUnitPrice':'0.00'}]
     }
-    return [{'key':str(k),'value':str(v)} for k,v in pairs.items() if str(v).strip()]
 
-
-def _sync_draft_order(b):
-    if not (SHOPIFY_STORE_DOMAIN and SHOPIFY_ADMIN_TOKEN): return
+def _sync_draft(record:Dict[str,Any]):
     try:
-        title={'event':'Event Brief','bespoke':'Bespoke Quote','corporate':'Corporate Request'}.get(b.request_type,'Philia Request')
-        tags=['PHILIA_REQUEST',f'TYPE_{b.request_type.upper()}',f'STATUS_{b.status.upper()}']
-        inp={'email':b.customer_email,'note':b.details[:5000],'tags':tags,'customAttributes':_draft_attrs(b),
-             'lineItems':[{'title':f'{title} — {b.reference}','quantity':1,'originalUnitPrice':'0.00'}]}
-        if b.customer_id: inp['purchasingEntity']={'customerId':f'gid://shopify/Customer/{b.customer_id}'}
-        if b.shopify_draft_order_id:
-            q='mutation($id:ID!,$input:DraftOrderInput!){draftOrderUpdate(id:$id,input:$input){draftOrder{id name} userErrors{field message}}}'
-            d=_shopify_graphql(q,{'id':b.shopify_draft_order_id,'input':inp}) or {}
-            node=((d.get('draftOrderUpdate') or {}).get('draftOrder') or {})
+        inp=_draft_input(record)
+        if record.get('shopify_draft_order_id'):
+            q='''mutation($id:ID!,$input:DraftOrderInput!){draftOrderUpdate(id:$id,input:$input){draftOrder{id name} userErrors{field message}}}'''
+            d=_gql(q,{'id':record['shopify_draft_order_id'],'input':inp}); _user_errors(d,'draftOrderUpdate'); node=((d.get('draftOrderUpdate') or {}).get('draftOrder') or {})
         else:
-            q='mutation($input:DraftOrderInput!){draftOrderCreate(input:$input){draftOrder{id name} userErrors{field message}}}'
-            d=_shopify_graphql(q,{'input':inp}) or {}
-            node=((d.get('draftOrderCreate') or {}).get('draftOrder') or {})
+            q='''mutation($input:DraftOrderInput!){draftOrderCreate(input:$input){draftOrder{id name} userErrors{field message}}}'''
+            d=_gql(q,{'input':inp}); _user_errors(d,'draftOrderCreate'); node=((d.get('draftOrderCreate') or {}).get('draftOrder') or {})
         if node:
-            b.shopify_draft_order_id=node.get('id'); b.shopify_draft_order_name=node.get('name')
+            record['shopify_draft_order_id']=node.get('id'); record['shopify_draft_order_name']=node.get('name')
+            return True
     except Exception as e:
-        print('[PHILIA BRIEFS] draft order sync failed',repr(e),flush=True)
+        print('[PHILIA REQUESTS] Draft order sync failed:',repr(e),flush=True)
+    return False
 
 
-def _mail(to_email: str, subject: str, body: str):
-    if not (SMTP_HOST and SMTP_FROM and to_email):
-        print('[PHILIA BRIEFS] email skipped (SMTP not configured):',subject,flush=True); return
+def _mail(to_email,subject,body):
+    if not (SMTP_HOST and SMTP_FROM and to_email): return False
     try:
         msg=EmailMessage(); msg['From']=SMTP_FROM; msg['To']=to_email; msg['Subject']=subject
         msg.set_content(re.sub('<[^>]+>','',body)); msg.add_alternative(body,subtype='html')
@@ -279,223 +320,127 @@ def _mail(to_email: str, subject: str, body: str):
             s.starttls()
             if SMTP_USER: s.login(SMTP_USER,SMTP_PASSWORD)
             s.send_message(msg)
-    except Exception as e: print('[PHILIA BRIEFS] email failed',repr(e),flush=True)
+        return True
+    except Exception as e:
+        print('[PHILIA REQUESTS] email failed',repr(e),flush=True); return False
 
-
-def _brief_email_html(b, heading):
-    fields=[('Reference',b.reference),('Type',b.request_type),('Status',b.status),('Name',b.customer_name),('Email',b.customer_email),('Phone',b.phone),('Date',b.event_date),('Guests',b.guest_count),('Venue',b.venue),('Budget',b.budget),('Occasion',b.occasion),('Colours',b.colours),('Company',b.company),('Quantity / scope',b.quantity_scope)]
-    rows=''.join(f'<tr><td style="padding:6px 12px;color:#607074">{html.escape(str(k))}</td><td style="padding:6px 12px"><b>{html.escape(str(v))}</b></td></tr>' for k,v in fields if v not in (None,''))
-    return f'<div style="font-family:Arial,sans-serif;color:#142326"><h2>{html.escape(heading)}</h2><table>{rows}</table><h3>Details</h3><p>{html.escape(b.details or "")}</p></div>'
-
-
-def _admin_token(username):
-    exp=int((_now()+timedelta(hours=12)).timestamp()); payload=f'{username}:{exp}'
-    sig=hmac.new(ADMIN_SESSION_SECRET.encode(),payload.encode(),hashlib.sha256).hexdigest()
-    return f'{payload}:{sig}'
-
-def _admin_ok(request: Request):
-    tok=request.cookies.get('philia_admin','')
-    try:
-        u,exp,sig=tok.rsplit(':',2); payload=f'{u}:{exp}'
-        if u!=ADMIN_DASHBOARD_USER or int(exp)<int(_now().timestamp()): return False
-        expected=hmac.new(ADMIN_SESSION_SECRET.encode(),payload.encode(),hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected,sig)
-    except Exception:return False
-
-def _require_admin(request):
-    if not _admin_ok(request): raise HTTPException(401,'Admin login required')
+def _email_html(r,heading):
+    rows=''.join(f'<tr><td style="padding:6px 10px;color:#667">{html.escape(k)}</td><td style="padding:6px 10px"><b>{html.escape(str(r.get(v) or ""))}</b></td></tr>' for k,v in [('Reference','reference'),('Type','request_type'),('Status','status'),('Name','customer_name'),('Email','customer_email'),('Phone','phone'),('Date','event_date'),('Guests','guest_count'),('Venue','venue'),('Budget','budget')])
+    return f'<div style="font-family:Arial;color:#142326"><h2>{html.escape(heading)}</h2><table>{rows}</table><h3>Details</h3><p>{html.escape(r.get("details") or "")}</p></div>'
 
 
 @router.get('/briefs/health')
 def briefs_health():
-    return {'ok':DB_ERROR is None,'database': 'ready' if DB_ERROR is None else DB_ERROR,
-            'shopify_sync':bool(SHOPIFY_STORE_DOMAIN and SHOPIFY_ADMIN_TOKEN),'smtp':bool(SMTP_HOST and SMTP_FROM),
-            'proxy_verification':bool(SHOPIFY_API_SECRET)}
+    ok=bool(SHOPIFY_SHOP and SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET)
+    data={'ok':ok,'storage':'shopify_metaobjects','shop':_shop_domain() if SHOPIFY_SHOP else None,'smtp':bool(SMTP_HOST and SMTP_FROM),'proxy_verification':bool(SHOPIFY_CLIENT_SECRET)}
+    if ok:
+        try: _ensure_definition(); data['metaobject_definition']='ready'
+        except Exception as e: data['ok']=False; data['metaobject_definition']=str(e)[:300]
+    return JSONResponse(data,status_code=200 if data['ok'] else 503)
 
-# These routes are mounted twice by main.py: direct /api/... and Shopify app-proxy /proxy/api/...
 @router.post('/api/briefs')
-def create_brief(payload: BriefCreate, request: Request):
-    _require_db()
+def create_brief(payload:BriefCreate, request:Request):
     customer_id=None
-    # When called through app proxy, verify signed identity. Direct calls can only create a guest request.
     if request.url.path.startswith('/proxy/'):
-        customer_id,_=_proxy_identity(request)
+        customer_id=_proxy_identity(request)
     kind=payload.request_type.strip().lower()
-    if kind not in VALID_TYPES: raise HTTPException(422,'Unknown request type')
+    if kind not in VALID_TYPES: raise HTTPException(422,'Unknown request type.')
     email=_clean(payload.email,320)
-    # When Shopify confirms a logged-in customer, prefer the verified customer
-    # email over browser-submitted identity fields.
-    if customer_id:
-        verified_email=_customer_email(customer_id)
-        if verified_email: email=verified_email
-    if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$',email or ''): raise HTTPException(422,'Valid email required')
-    token=secrets.token_urlsafe(32)
-    with SessionLocal() as db:
-        ref=_reference(kind)
-        b=Brief(reference=ref,request_type=kind,status='submitted',customer_id=customer_id,
-                customer_email=email,customer_name=_clean(payload.name,180) or 'Customer',phone=_clean(payload.phone,80),
-                event_date=_date(payload.event_date),guest_count=payload.guest_count,venue=_clean(payload.venue,300),
-                budget=_clean(payload.budget,180),occasion=_clean(payload.occasion,240),colours=_clean(payload.colours,300),
-                company=_clean(payload.company,240),quantity_scope=_clean(payload.quantity_scope,300),
-                details=_clean(payload.details,12000) or '', manage_token_hash=_hash_token(token),created_at=_now(),updated_at=_now())
-        db.add(b); db.flush(); _audit(db,b,'customer','created',_serialize(b)); _sync_draft_order(b); db.commit(); db.refresh(b)
-        merchant=PHILIA_NOTIFICATION_EMAIL
-        if merchant: _mail(merchant,f'New Philia request {b.reference}',_brief_email_html(b,'New Philia request'))
-        _mail(b.customer_email,f'We received your Philia request {b.reference}',_brief_email_html(b,'Your request has been received'))
-        return {'ok':True,'brief':_serialize(b),'manage_token':token}
-
-
-def _get_customer_records(request: Request, db):
-    cid,_=_proxy_identity(request)
-    if not cid: raise HTTPException(401,'Please sign in to manage your Philia requests.')
-    email=_customer_email(cid)
-    q=select(Brief).where(Brief.customer_id==cid)
-    if email: q=select(Brief).where(or_(Brief.customer_id==cid,func.lower(Brief.customer_email)==email.lower()))
-    rows=list(db.execute(q.order_by(Brief.created_at.desc())).scalars().all())
-    if email:
-        changed=False
-        for b in rows:
-            if not b.customer_id: b.customer_id=cid; changed=True
-        if changed: db.commit()
-    return cid,email,rows
+    if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$',email or ''): raise HTTPException(422,'Valid email required.')
+    now=_now(); ref=_reference(kind)
+    rec={
+        'reference':ref,'request_type':kind,'status':'submitted','customer_id':customer_id or '',
+        'customer_email':email,'customer_name':_clean(payload.name,180) or 'Customer','phone':_clean(payload.phone,80) or '',
+        'event_date':_clean(payload.event_date,10) or '','guest_count':payload.guest_count or '', 'venue':_clean(payload.venue,300) or '',
+        'budget':_clean(payload.budget,180) or '', 'occasion':_clean(payload.occasion,240) or '', 'colours':_clean(payload.colours,300) or '',
+        'company':_clean(payload.company,240) or '', 'quantity_scope':_clean(payload.quantity_scope,300) or '', 'details':_clean(payload.details,12000) or '',
+        'quote_amount_kwd':'','internal_note':'','cancellation_reason':'','shopify_draft_order_id':'','shopify_draft_order_name':'',
+        'created_at':now,'updated_at':now,'cancelled_at':'','last_customer_edit_at':'','audit_history':[]
+    }
+    _audit(rec,'customer','created',{'request_type':kind})
+    rec=_create_meta(rec)
+    if _sync_draft(rec): rec=_update_meta(rec)
+    if PHILIA_NOTIFICATION_EMAIL: _mail(PHILIA_NOTIFICATION_EMAIL,f'New Philia request {ref}',_email_html(rec,'New Philia request'))
+    _mail(email,f'We received your Philia request {ref}',_email_html(rec,'Your request has been received'))
+    return {'ok':True,'brief':_serialize(rec)}
 
 @router.get('/api/briefs')
-def list_briefs(request: Request):
-    _require_db()
-    if not request.url.path.startswith('/proxy/'):
-        raise HTTPException(401,'Customer list requires Shopify app proxy.')
-    with SessionLocal() as db:
-        cid,email,rows=_get_customer_records(request,db)
-        return {'ok':True,'customer_id':cid,'email':email,'briefs':[_serialize(x) for x in rows]}
+def list_briefs(request:Request):
+    if not request.url.path.startswith('/proxy/'): raise HTTPException(401,'Customer list requires Shopify app proxy.')
+    cid=_proxy_identity(request)
+    if not cid: raise HTTPException(401,'Please sign in to manage your Philia requests.')
+    rows=[r for r in _all_records() if str(r.get('customer_id') or '')==str(cid)]
+    rows.sort(key=lambda x:x.get('created_at') or '',reverse=True)
+    return {'ok':True,'customer_id':cid,'briefs':[_serialize(r) for r in rows]}
+
+def _authorized_record(reference:str,request:Request):
+    if not request.url.path.startswith('/proxy/'): raise HTTPException(401,'Shopify app proxy required.')
+    cid=_proxy_identity(request)
+    if not cid: raise HTTPException(401,'Please sign in to manage this request.')
+    r=_get_by_reference(reference)
+    if not r: raise HTTPException(404,'Request not found.')
+    if str(r.get('customer_id') or '')!=str(cid): raise HTTPException(403,'Not allowed.')
+    return r
 
 @router.patch('/api/briefs/{reference}')
-def update_brief(reference: str, payload: BriefUpdate, request: Request):
-    _require_db()
-    with SessionLocal() as db:
-        b=db.execute(select(Brief).where(Brief.reference==reference)).scalar_one_or_none()
-        if not b: raise HTTPException(404,'Request not found')
-        authorized=False; actor='customer'
-        if request.url.path.startswith('/proxy/'):
-            cid,email,_=_get_customer_records(request,db)
-            authorized=(b.customer_id==cid or (email and b.customer_email.lower()==email.lower()))
-        else:
-            tok=request.headers.get('X-Philia-Manage-Token',''); authorized=bool(tok and hmac.compare_digest(_hash_token(tok),b.manage_token_hash))
-        if not authorized: raise HTTPException(403,'Not allowed')
-        if b.status in {'cancelled','completed'}: raise HTTPException(409,'This request can no longer be edited.')
-        changes={}
-        for key in ['phone','venue','budget','occasion','colours','company','quantity_scope','details']:
-            val=getattr(payload,key)
-            if val is not None:
-                setattr(b,key,_clean(val,12000 if key=='details' else 300)); changes[key]=val
-        if payload.event_date is not None: b.event_date=_date(payload.event_date); changes['event_date']=payload.event_date
-        if payload.guest_count is not None: b.guest_count=max(1,payload.guest_count); changes['guest_count']=payload.guest_count
-        b.updated_at=_now(); b.last_customer_edit_at=_now()
-        if b.status=='quoted': b.status='in_review'
-        _audit(db,b,actor,'customer_updated',changes); _sync_draft_order(b); db.commit(); db.refresh(b)
-        if PHILIA_NOTIFICATION_EMAIL: _mail(PHILIA_NOTIFICATION_EMAIL,f'Customer updated {b.reference}',_brief_email_html(b,'Customer updated a Philia request'))
-        return {'ok':True,'brief':_serialize(b)}
+def update_brief(reference:str,payload:BriefUpdate,request:Request):
+    r=_authorized_record(reference,request)
+    if r.get('status') not in EDITABLE_STATUSES: raise HTTPException(409,'This request can no longer be edited.')
+    changes={}
+    for key in ['phone','venue','budget','occasion','colours','company','quantity_scope','details']:
+        v=getattr(payload,key)
+        if v is not None: r[key]=_clean(v,12000 if key=='details' else 300) or ''; changes[key]=r[key]
+    if payload.event_date is not None: r['event_date']=_clean(payload.event_date,10) or ''; changes['event_date']=r['event_date']
+    if payload.guest_count is not None: r['guest_count']=max(1,payload.guest_count); changes['guest_count']=r['guest_count']
+    r['updated_at']=_now(); r['last_customer_edit_at']=r['updated_at']
+    if r.get('status')=='quoted': r['status']='in_review'
+    _audit(r,'customer','updated',changes)
+    _sync_draft(r); r=_update_meta(r)
+    if PHILIA_NOTIFICATION_EMAIL: _mail(PHILIA_NOTIFICATION_EMAIL,f'Customer updated {r["reference"]}',_email_html(r,'Customer updated a Philia request'))
+    return {'ok':True,'brief':_serialize(r)}
 
 @router.post('/api/briefs/{reference}/cancel')
-def cancel_brief(reference: str, payload: CancelPayload, request: Request):
-    _require_db()
-    with SessionLocal() as db:
-        b=db.execute(select(Brief).where(Brief.reference==reference)).scalar_one_or_none()
-        if not b: raise HTTPException(404,'Request not found')
-        authorized=False
-        if request.url.path.startswith('/proxy/'):
-            cid,email,_=_get_customer_records(request,db); authorized=(b.customer_id==cid or (email and b.customer_email.lower()==email.lower()))
-        else:
-            tok=request.headers.get('X-Philia-Manage-Token',''); authorized=bool(tok and hmac.compare_digest(_hash_token(tok),b.manage_token_hash))
-        if not authorized: raise HTTPException(403,'Not allowed')
-        if b.status=='cancelled': return {'ok':True,'brief':_serialize(b)}
-        b.status='cancelled'; b.cancellation_reason=_clean(payload.reason,1500); b.cancelled_at=_now(); b.updated_at=_now()
-        _audit(db,b,'customer','cancelled',{'reason':b.cancellation_reason}); _sync_draft_order(b); db.commit(); db.refresh(b)
-        body=_brief_email_html(b,'Customer cancelled a Philia request')+f'<p><b>Cancellation reason:</b> {html.escape(b.cancellation_reason or "Not provided")}</p>'
-        if PHILIA_NOTIFICATION_EMAIL: _mail(PHILIA_NOTIFICATION_EMAIL,f'CANCELLED — {b.reference}',body)
-        _mail(b.customer_email,f'Cancellation confirmed — {b.reference}',_brief_email_html(b,'Your cancellation is confirmed'))
-        return {'ok':True,'brief':_serialize(b)}
+def cancel_brief(reference:str,payload:CancelPayload,request:Request):
+    r=_authorized_record(reference,request)
+    if r.get('status')=='cancelled': return {'ok':True,'brief':_serialize(r)}
+    r['status']='cancelled'; r['cancellation_reason']=_clean(payload.reason,1500) or ''; r['cancelled_at']=_now(); r['updated_at']=r['cancelled_at']
+    _audit(r,'customer','cancelled',{'reason':r['cancellation_reason']})
+    _sync_draft(r); r=_update_meta(r)
+    sent=False
+    if PHILIA_NOTIFICATION_EMAIL:
+        sent=_mail(PHILIA_NOTIFICATION_EMAIL,f'CANCELLED — {r["reference"]}',_email_html(r,'Customer cancelled a Philia request')+f'<p><b>Reason:</b> {html.escape(r.get("cancellation_reason") or "Not provided")}</p>')
+    _mail(r.get('customer_email'),f'Cancellation confirmed — {r["reference"]}',_email_html(r,'Your cancellation is confirmed'))
+    return {'ok':True,'brief':_serialize(r),'merchant_email_sent':sent}
 
-# ---- Admin dashboard ----
-@router.post('/admin/api/login')
-def admin_login(payload: AdminLogin):
-    if not ADMIN_DASHBOARD_PASSWORD: raise HTTPException(503,'ADMIN_DASHBOARD_PASSWORD is not configured')
-    if not (hmac.compare_digest(payload.username,ADMIN_DASHBOARD_USER) and hmac.compare_digest(payload.password,ADMIN_DASHBOARD_PASSWORD)):
-        raise HTTPException(401,'Invalid login')
-    resp=JSONResponse({'ok':True}); resp.set_cookie('philia_admin',_admin_token(payload.username),httponly=True,secure=True,samesite='lax',max_age=43200,path='/')
-    return resp
 
-@router.post('/admin/api/logout')
-def admin_logout():
-    resp=JSONResponse({'ok':True}); resp.delete_cookie('philia_admin',path='/'); return resp
+def _admin_ok(request:Request):
+    token=request.cookies.get('philia_admin','')
+    try:
+        u,exp,sig=token.rsplit(':',2); payload=f'{u}:{exp}'
+        if u!=ADMIN_DASHBOARD_USER or int(exp)<int(time.time()): return False
+        want=hmac.new(ADMIN_SESSION_SECRET.encode(),payload.encode(),hashlib.sha256).hexdigest()
+        return hmac.compare_digest(want,sig)
+    except Exception:return False
 
-@router.get('/admin/api/briefs')
-def admin_briefs(request: Request, status: Optional[str]=None, q: Optional[str]=None):
-    _require_admin(request); _require_db()
-    with SessionLocal() as db:
-        stmt=select(Brief)
-        if status and status in VALID_STATUSES: stmt=stmt.where(Brief.status==status)
-        if q:
-            like=f'%{q.strip()}%'; stmt=stmt.where(or_(Brief.reference.ilike(like),Brief.customer_email.ilike(like),Brief.customer_name.ilike(like),Brief.venue.ilike(like),Brief.company.ilike(like)))
-        rows=list(db.execute(stmt.order_by(Brief.created_at.desc()).limit(500)).scalars().all())
-        now=date.today(); stats={}
-        for st in VALID_STATUSES: stats[st]=db.execute(select(func.count()).select_from(Brief).where(Brief.status==st)).scalar_one()
-        needs=db.execute(select(func.count()).select_from(Brief).where(Brief.status.in_(['submitted','in_review']),Brief.created_at < _now()-timedelta(hours=24))).scalar_one()
-        upcoming=db.execute(select(func.count()).select_from(Brief).where(Brief.event_date>=now,Brief.event_date<=now+timedelta(days=14),Brief.status!='cancelled')).scalar_one()
-        return {'ok':True,'stats':stats,'needs_response':needs,'upcoming_14_days':upcoming,'briefs':[_serialize(x,True) for x in rows]}
-
-@router.get('/admin/api/briefs/{reference}/audit')
-def admin_audit(reference: str, request: Request):
-    _require_admin(request); _require_db()
-    with SessionLocal() as db:
-        rows=list(db.execute(select(BriefAudit).where(BriefAudit.reference==reference).order_by(BriefAudit.created_at.desc())).scalars().all())
-        return {'ok':True,'audit':[{'actor':x.actor,'action':x.action,'payload':json.loads(x.payload_json or '{}'),'created_at':x.created_at.isoformat()} for x in rows]}
-
-@router.patch('/admin/api/briefs/{reference}')
-def admin_update(reference: str,payload: AdminUpdate,request: Request):
-    _require_admin(request); _require_db()
-    with SessionLocal() as db:
-        b=db.execute(select(Brief).where(Brief.reference==reference)).scalar_one_or_none()
-        if not b: raise HTTPException(404,'Not found')
-        changes={}
-        if payload.status:
-            if payload.status not in VALID_STATUSES: raise HTTPException(422,'Invalid status')
-            b.status=payload.status; changes['status']=payload.status
-            if payload.status=='cancelled' and not b.cancelled_at: b.cancelled_at=_now()
-        if payload.quote_amount_kwd is not None: b.quote_amount_kwd=payload.quote_amount_kwd; changes['quote_amount_kwd']=payload.quote_amount_kwd
-        if payload.internal_note is not None: b.internal_note=_clean(payload.internal_note,10000); changes['internal_note']=payload.internal_note
-        b.updated_at=_now(); _audit(db,b,'merchant','admin_updated',changes); _sync_draft_order(b); db.commit(); db.refresh(b)
-        if 'status' in changes or 'quote_amount_kwd' in changes:
-            _mail(b.customer_email,f'Update on your Philia request {b.reference}',_brief_email_html(b,'Your Philia request has been updated'))
-        return {'ok':True,'brief':_serialize(b,True)}
-
-@router.get('/admin/api/export.csv')
-def admin_export(request: Request):
-    _require_admin(request); _require_db()
-    with SessionLocal() as db:
-        rows=list(db.execute(select(Brief).order_by(Brief.created_at.desc())).scalars().all())
-        s=io.StringIO(); w=csv.writer(s); w.writerow(['reference','type','status','name','email','phone','date','guests','venue','budget','company','created_at','updated_at'])
-        for b in rows: w.writerow([b.reference,b.request_type,b.status,b.customer_name,b.customer_email,b.phone,b.event_date,b.guest_count,b.venue,b.budget,b.company,b.created_at,b.updated_at])
-        return StreamingResponse(iter([s.getvalue()]),media_type='text/csv',headers={'Content-Disposition':'attachment; filename=philia-requests.csv'})
-
-@router.post('/cron/brief-summary')
-def cron_summary(request: Request):
-    if not CRON_SECRET or request.headers.get('X-Cron-Secret')!=CRON_SECRET: raise HTTPException(401,'Unauthorized')
-    _require_db()
-    with SessionLocal() as db:
-        old=list(db.execute(select(Brief).where(Brief.status.in_(['submitted','in_review']),Brief.created_at<_now()-timedelta(hours=24))).scalars().all())
-        upcoming=list(db.execute(select(Brief).where(Brief.event_date>=date.today(),Brief.event_date<=date.today()+timedelta(days=7),Brief.status!='cancelled')).scalars().all())
-        if PHILIA_NOTIFICATION_EMAIL and (old or upcoming):
-            body=f'<h2>Philia request summary</h2><p><b>{len(old)}</b> requests need a response.</p><p><b>{len(upcoming)}</b> events are within 7 days.</p>'
-            _mail(PHILIA_NOTIFICATION_EMAIL,'Philia daily request summary',body)
-        return {'ok':True,'needs_response':len(old),'upcoming_7_days':len(upcoming)}
-
-ADMIN_HTML = r'''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Philia Request Command Center</title><style>
-:root{--ink:#082f38;--ink2:#061f26;--gold:#bfae73;--cream:#f4eee5;--muted:#8aa0a4}*{box-sizing:border-box}body{margin:0;font-family:Inter,Arial,sans-serif;background:#071b20;color:var(--cream)}button,input,select,textarea{font:inherit}.login{min-height:100vh;display:grid;place-items:center}.box{width:min(420px,92vw);background:#0b3038;border:1px solid #234952;padding:28px}.box h1{margin-top:0}.box input,.toolbar input,.toolbar select,.drawer input,.drawer textarea,.drawer select{width:100%;padding:12px;background:#0a252b;border:1px solid #34515a;color:#fff}.btn{border:0;background:var(--gold);color:#10262b;padding:11px 15px;font-weight:700;cursor:pointer}.app{display:none}.top{position:sticky;top:0;z-index:5;background:rgba(7,27,32,.94);backdrop-filter:blur(16px);padding:18px 24px;border-bottom:1px solid #24434a;display:flex;align-items:center;justify-content:space-between}.top h1{font-size:18px;margin:0}.wrap{padding:24px;max-width:1500px;margin:auto}.stats{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:10px;margin-bottom:18px}.stat{background:#0b2b32;border:1px solid #21434b;padding:16px}.stat b{font-size:25px;display:block;color:var(--gold)}.toolbar{display:grid;grid-template-columns:2fr 1fr auto;gap:9px;margin-bottom:14px}.table{background:#0a252b;border:1px solid #21434b;overflow:auto}.row{display:grid;grid-template-columns:150px 110px 130px 1.2fr 1.4fr 120px 130px;gap:10px;align-items:center;padding:13px 14px;border-bottom:1px solid #183941;min-width:1000px}.row.head{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em}.row.item{cursor:pointer}.row.item:hover{background:#0e343c}.status{display:inline-flex;padding:6px 9px;border:1px solid #456168;font-size:11px;text-transform:uppercase}.drawer{position:fixed;right:0;top:0;width:min(560px,100%);height:100vh;background:#09272e;border-left:1px solid #31515a;z-index:20;transform:translateX(100%);transition:.25s;padding:24px;overflow:auto}.drawer.open{transform:none}.drawer h2{margin:0 0 5px}.kv{display:grid;grid-template-columns:130px 1fr;gap:7px;border-bottom:1px solid #214149;padding:9px 0}.kv span{color:var(--muted)}.actions{display:grid;gap:10px;margin-top:18px}.audit{margin-top:20px}.audit div{border-left:2px solid var(--gold);padding:7px 10px;margin:8px 0;background:#0b3038;font-size:12px}.close{float:right;background:none;border:0;color:white;font-size:24px}@media(max-width:900px){.stats{grid-template-columns:repeat(2,1fr)}.toolbar{grid-template-columns:1fr}.wrap{padding:14px}}
-</style></head><body><div class="login" id="login"><form class="box" id="loginForm"><h1>Philia Request Command Center</h1><p>Owner dashboard for event, bespoke and corporate requests.</p><input id="user" placeholder="Username" value="philia" required><br><br><input id="pass" type="password" placeholder="Password" required><br><br><button class="btn">Sign in</button><p id="loginMsg"></p></form></div><div class="app" id="app"><header class="top"><h1>PHILIA · Request Command Center</h1><div><a class="btn" href="/admin/api/export.csv" style="text-decoration:none">Export CSV</a> <button class="btn" id="logout">Logout</button></div></header><main class="wrap"><div class="stats" id="stats"></div><div class="toolbar"><input id="search" placeholder="Search reference, customer, email, venue, company"><select id="status"><option value="">All statuses</option><option>submitted</option><option>in_review</option><option>quoted</option><option>confirmed</option><option>completed</option><option>cancelled</option></select><button class="btn" id="refresh">Refresh</button></div><div class="table"><div class="row head"><div>Reference</div><div>Type</div><div>Status</div><div>Customer</div><div>Venue / company</div><div>Date</div><div>Created</div></div><div id="rows"></div></div></main></div><aside class="drawer" id="drawer"><button class="close" id="close">×</button><div id="detail"></div></aside><script>
-const $=s=>document.querySelector(s);let data=[];async function api(u,o={}){const r=await fetch(u,{headers:{'Content-Type':'application/json'},...o});if(r.status===401){$('#login').style.display='grid';$('#app').style.display='none';throw Error('login')};const j=await r.json();if(!r.ok)throw Error(j.detail||'Request failed');return j}async function load(){let u='/admin/api/briefs?';if($('#status').value)u+='status='+encodeURIComponent($('#status').value)+'&';if($('#search').value)u+='q='+encodeURIComponent($('#search').value);const j=await api(u);data=j.briefs;$('#stats').innerHTML=[['Submitted',j.stats.submitted],['In review',j.stats.in_review],['Quoted',j.stats.quoted],['Confirmed',j.stats.confirmed],['Needs response',j.needs_response],['Next 14 days',j.upcoming_14_days]].map(x=>`<div class=stat><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');$('#rows').innerHTML=data.map((b,i)=>`<div class="row item" data-i=${i}><div>${b.reference}</div><div>${b.request_type}</div><div><span class=status>${b.status}</span></div><div>${esc(b.name)}<br><small>${esc(b.email)}</small></div><div>${esc(b.venue||b.company||'—')}</div><div>${b.event_date||'—'}</div><div>${new Date(b.created_at).toLocaleDateString()}</div></div>`).join('');document.querySelectorAll('.row.item').forEach(x=>x.onclick=()=>openBrief(data[+x.dataset.i]))}function esc(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}async function openBrief(b){const aud=await api('/admin/api/briefs/'+b.reference+'/audit');$('#detail').innerHTML=`<h2>${b.reference}</h2><p>${b.request_type} · ${b.status}</p>${Object.entries({Name:b.name,Email:b.email,Phone:b.phone,Date:b.event_date,Guests:b.guest_count,Venue:b.venue,Budget:b.budget,Occasion:b.occasion,Colours:b.colours,Company:b.company,'Quantity / scope':b.quantity_scope,'Shopify draft':b.shopify_draft_order_name}).filter(x=>x[1]).map(x=>`<div class=kv><span>${x[0]}</span><b>${esc(x[1])}</b></div>`).join('')}<h3>Customer details</h3><p>${esc(b.details)}</p><div class=actions><label>Status<select id=editStatus>${['submitted','in_review','quoted','confirmed','completed','cancelled'].map(s=>`<option ${s==b.status?'selected':''}>${s}</option>`).join('')}</select></label><label>Quote amount KWD<input id=quote type=number step=.001 value="${b.quote_amount_kwd??''}"></label><label>Internal note<textarea id=note rows=5>${esc(b.internal_note||'')}</textarea></label><button class=btn id=save>Save update</button></div><div class=audit><h3>Timeline</h3>${aud.audit.map(a=>`<div><b>${a.action}</b> · ${a.actor}<br><small>${new Date(a.created_at).toLocaleString()}</small></div>`).join('')}</div>`;$('#drawer').classList.add('open');$('#save').onclick=async()=>{await api('/admin/api/briefs/'+b.reference,{method:'PATCH',body:JSON.stringify({status:$('#editStatus').value,quote_amount_kwd:$('#quote').value?+$('#quote').value:null,internal_note:$('#note').value})});await load();$('#drawer').classList.remove('open')}}$('#loginForm').onsubmit=async e=>{e.preventDefault();try{await api('/admin/api/login',{method:'POST',body:JSON.stringify({username:$('#user').value,password:$('#pass').value})});$('#login').style.display='none';$('#app').style.display='block';load()}catch(err){$('#loginMsg').textContent='Login failed'}};$('#refresh').onclick=load;$('#status').onchange=load;let t;$('#search').oninput=()=>{clearTimeout(t);t=setTimeout(load,350)};$('#close').onclick=()=>$('#drawer').classList.remove('open');$('#logout').onclick=async()=>{await api('/admin/api/logout',{method:'POST'});location.reload()};(async()=>{try{await load();$('#login').style.display='none';$('#app').style.display='block'}catch(e){}})();
-</script></body></html>'''
+def _admin_token():
+    exp=int(time.time()+12*3600); payload=f'{ADMIN_DASHBOARD_USER}:{exp}'
+    sig=hmac.new(ADMIN_SESSION_SECRET.encode(),payload.encode(),hashlib.sha256).hexdigest(); return f'{payload}:{sig}'
 
 @router.get('/admin',response_class=HTMLResponse)
-def admin_page(): return HTMLResponse(ADMIN_HTML,headers={'Content-Security-Policy':"frame-ancestors https://admin.shopify.com https://*.myshopify.com"})
-@router.get('/admin/briefs',response_class=HTMLResponse)
-def admin_page2(): return HTMLResponse(ADMIN_HTML,headers={'Content-Security-Policy':"frame-ancestors https://admin.shopify.com https://*.myshopify.com"})
+def admin_page(request:Request):
+    if not ADMIN_DASHBOARD_PASSWORD:
+        return HTMLResponse('<h2>Philia Request Center</h2><p>Set ADMIN_DASHBOARD_PASSWORD in Render to enable this dashboard.</p>',503)
+    if not _admin_ok(request):
+        return HTMLResponse('''<!doctype html><meta name="viewport" content="width=device-width"><style>body{font-family:Arial;background:#092e36;color:#fff;display:grid;place-items:center;height:100vh;margin:0}form{background:#f5efe3;color:#123;padding:32px;width:min(360px,80vw)}input,button{width:100%;padding:12px;margin-top:10px;box-sizing:border-box}</style><form method="post" action="/admin/login"><h2>Philia Request Center</h2><input name="password" type="password" placeholder="Dashboard password" required><button>Sign in</button></form>''')
+    rows=_all_records(); rows.sort(key=lambda x:x.get('created_at') or '',reverse=True)
+    cards=''.join(f'''<tr><td>{html.escape(r.get('reference') or '')}</td><td>{html.escape(r.get('request_type') or '')}</td><td><b>{html.escape(r.get('status') or '')}</b></td><td>{html.escape(r.get('customer_name') or '')}<br><small>{html.escape(r.get('customer_email') or '')}</small></td><td>{html.escape(r.get('event_date') or '')}</td><td>{html.escape(r.get('venue') or '')}</td><td>{html.escape(r.get('budget') or '')}</td><td>{html.escape(r.get('shopify_draft_order_name') or '')}</td></tr>''' for r in rows)
+    counts={s:sum(1 for r in rows if r.get('status')==s) for s in ['submitted','in_review','quoted','confirmed','cancelled']}
+    return HTMLResponse(f'''<!doctype html><meta name="viewport" content="width=device-width"><style>body{{font-family:Arial;margin:0;background:#f4efe6;color:#123}}header{{background:#072f38;color:#fff;padding:24px}}main{{padding:22px;overflow:auto}}.stats{{display:flex;gap:8px;flex-wrap:wrap}}.stat{{background:#fff;padding:14px;min-width:110px}}table{{width:100%;border-collapse:collapse;background:#fff;margin-top:18px;min-width:900px}}th,td{{padding:11px;border-bottom:1px solid #ddd;text-align:left;font-size:13px}}th{{background:#0d4551;color:#fff}}</style><header><h1>Philia Request Center</h1><p>Shopify-native request database · {len(rows)} total requests</p></header><main><div class="stats">{''.join(f'<div class="stat"><b>{counts[s]}</b><br>{s.replace("_"," ").title()}</div>' for s in counts)}</div><table><thead><tr><th>Reference</th><th>Type</th><th>Status</th><th>Customer</th><th>Date</th><th>Venue</th><th>Budget</th><th>Draft</th></tr></thead><tbody>{cards}</tbody></table></main>''')
+
+@router.post('/admin/login')
+async def admin_login(request:Request):
+    form=await request.form(); pw=str(form.get('password') or '')
+    if not hmac.compare_digest(pw,ADMIN_DASHBOARD_PASSWORD): raise HTTPException(401,'Wrong password')
+    resp=HTMLResponse('<meta http-equiv="refresh" content="0;url=/admin">Signed in')
+    resp.set_cookie('philia_admin',_admin_token(),httponly=True,secure=True,samesite='lax',max_age=43200)
+    return resp
