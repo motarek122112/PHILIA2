@@ -1,19 +1,15 @@
-# Philia AI Backend V32.2 — ALF Engine + Verified Shopify Actions
+# Philia Flowers — AI Backend + Shopify-Native Requests V34.1
 
-This backend keeps the ALF V4.3 Python/FastAPI/Groq conversation architecture and JSON action contract, with Philia-specific website content.
+FastAPI Render backend preserving Philia AI endpoints from the supplied backend and adding Shopify Metaobjects-based request lifecycle. Does **not** require PostgreSQL.
 
-## What changed in V32.2
-- Accepts the live Philia Shopify product snapshot through the same ALF request envelope (`enquiry`).
-- Treats that snapshot as `storefront_products` inside model context.
-- Product add/navigation actions are validated against real handles supplied by the theme.
-- Product discovery is instructed to return useful real product actions instead of a text-only catalogue.
-- A simple "yes" can confirm add-to-cart only when the immediately previous assistant message explicitly asked to add the selected product.
-- Compliments never auto-add products.
-- Unverified "added to cart" claims are rewritten before the browser executes the real Shopify action.
-- Browser remains the authority on whether cart/form/navigation actions actually succeeded.
+## Source
+- `main.py`: existing Philia assistant endpoints (unchanged except router mount carried over from uploaded V34).
+- `briefs_system.py`: signed Shopify App Proxy, access token handling, request Metaobjects, Draft Order mirroring, optional SMTP notifications.
+- `requirements.txt`, `render.yaml`, `Procfile`: hosting.
+- `env.example`: environment variable names with no credentials.
+- `PRODUCTION_SETUP.md`: deployment / acceptance checklist.
 
-## Render
-Build: `pip install -r requirements.txt`
-Start: `python -m uvicorn main:app --host 0.0.0.0 --port $PORT`
+## Limitations
+Guest submissions are not automatically associated with a later-created Shopify account; sign-in before submitting for online editing/cancellation. Email notices require configured SMTP. This backend cannot inject a custom admin app page into Shopify Admin; requests are managed in Shopify native Metaobjects and Draft Orders.
 
-Set `GROQ_API_KEY`. The ALF default model remains `openai/gpt-oss-20b` unless `GROQ_MODEL` overrides it.
+Read `PRODUCTION_SETUP.md` before publishing the paired Theme V130.

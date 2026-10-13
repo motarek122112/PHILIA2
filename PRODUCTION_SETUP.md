@@ -1,46 +1,50 @@
-# Philia V33 — Production Request System Setup
+# Philia Flowers — Shopify Native Requests (Backend V34.1 + Theme V130)
 
-This backend keeps the existing V32.2 AI engine unchanged and adds a separate request/account/admin subsystem.
+These two ZIPs must be used **together**. No PostgreSQL database is used.
 
-## 1. Render PostgreSQL
-Create a PostgreSQL database in Render and copy its **Internal Database URL** into `DATABASE_URL` on the Philia backend service.
+## Deployment order
 
-## 2. Shopify app / App Proxy
-The customer portal uses a signed Shopify App Proxy so a browser cannot impersonate another customer.
+1. Upload the **contents** of the Backend V34.1 ZIP to the existing GitHub repo linked to Render service **PHILIA2** (`https://philia2.onrender.com`). Do not upload the ZIP as a single file into GitHub.
+2. Verify these Render Environment Variables are set (never expose their values in screenshots):
 
-Create/install a Shopify app for the Philia store and configure:
-- App proxy subpath: `philia-briefs`
-- Prefix: `apps`
-- Proxy URL: `https://YOUR-PHILIA-BACKEND.onrender.com/proxy`
+   - `SHOPIFY_SHOP=philia-flowers-kw` — the actual original `.myshopify.com` subdomain without suffix, if it matches your Shopify Admin store domain.
+   - `SHOPIFY_CLIENT_ID` — Shopify Dev Dashboard app's Client ID.
+   - `SHOPIFY_CLIENT_SECRET` — Shopify Dev Dashboard app's Client secret.
+   - `GROQ_API_KEY` — preserve your existing AI credential.
+   - `SHOPIFY_ADMIN_API_VERSION=2026-10` (optional; this is the default).
+   - `ALLOW_UNSIGNED_PROXY=false` (required for secure production).
 
-The storefront then calls `/apps/philia-briefs/api/briefs` on the Philia domain. Shopify signs the request and includes the logged-in customer ID.
+   If old `SHOPIFY_STORE_DOMAIN` remains set, the backend prefers `SHOPIFY_SHOP` when present. Do not add `DATABASE_URL`.
 
-Set `SHOPIFY_API_SECRET` to the app client secret.
+3. Wait for **Deploy succeeded / Live**. Check Render logs for `[PHILIA REQUESTS] Shopify-native Metaobject storage ready`. If setup has a missing scope or token issue, logs will say initialization deferred.
+4. On Shopify Dev Dashboard, app **Philia Request System**, ensure **V2 Active / installed on Philia** and App Proxy:
 
-## 3. Shopify Admin API sync
-Create an Admin API token with:
-- `read_customers`
-- `write_draft_orders`
+   - Prefix `apps`
+   - Subpath `philia-briefs`
+   - Proxy URL `https://philia2.onrender.com/proxy`
 
-Set `SHOPIFY_STORE_DOMAIN` and `SHOPIFY_ADMIN_TOKEN`.
+5. Open your storefront URL at `/apps/philia-briefs/api/briefs/health`. A configured proxy/backend should respond with JSON including `"ok":true` and `"storage":"shopify_metaobjects"`. If the browser shows a Shopify 404 or an HTML login page, the proxy is not connected correctly.
+6. Upload Theme V130 in **Shopify → Online Store → Themes → Add theme → Upload zip file**. Keep it **unpublished** while testing. Theme Settings → Requests & customer portal → `Request system App Proxy base` should be `/apps/philia-briefs` and enabled.
+7. Sign in to a real customer account on the **storefront** before sending a test event brief. Submit one test from Events / Wedding, then verify it appears in **Shopify Admin → Content → Metaobjects → Philia Requests** and **Orders → Drafts**.
+8. In the storefront, open account icon → My Philia Requests; edit the request and cancel it, verifying the status and audit history in Shopify Admin. Do not test with real customers until this succeeds.
+9. If desired, configure email credentials under Render so New / Edited / Cancelled requests generate email messages:
 
-Every Philia request is then mirrored into **Shopify Admin → Orders → Drafts** with its request reference, status, customer, date, venue, budget and details. Updates/cancellations change the Draft Order tags and custom attributes.
+   - `PHILIA_NOTIFICATION_EMAIL` — merchant inbox
+   - `SMTP_HOST`, `SMTP_PORT=587`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`
 
-## 4. Email
-Set SMTP values and `PHILIA_NOTIFICATION_EMAIL`. New, edited and cancelled requests notify Philia. Customer receives confirmation emails as well.
+   **Without SMTP, no cancellation email is sent.** The cancellation still updates Shopify Metaobjects / Draft Orders. Email status must not be assumed from a saved request.
+10. Publish V130 after the live tests pass, and retain your published theme as a rollback until then.
 
-## 5. Smart merchant dashboard
-Set `ADMIN_DASHBOARD_PASSWORD` and `ADMIN_SESSION_SECRET`.
+## What the merchant can manage
 
-Open:
-`https://YOUR-PHILIA-BACKEND.onrender.com/admin`
+- **Shopify Admin → Content → Metaobjects → Philia Requests**: the central request record, customer identity at time of submission, status, dates, details, quote amount, internal note, cancellation reason, audit JSON.
+- **Shopify Admin → Orders → Drafts**: an optional zero-value commercial mirror of each request. This is a draft for tracking, not an actual payment or completed purchase. Do not send an invoice for a zero-value request line.
+- Theme Editor settings control the **interface**, not live customer database entries.
 
-Dashboard includes status totals, 24h response alerts, upcoming 14-day events, search/filter, quote amount, internal notes, audit timeline and CSV export.
+## Important functional limits
 
-## 6. Optional automated daily summary
-Create a Render Cron Job that POSTs to `/cron/brief-summary` with header `X-Cron-Secret: <CRON_SECRET>` once daily.
-
-## Important
-A Shopify theme cannot directly create a new native page inside Shopify Admin. This build solves that in two production-safe ways:
-1. Every request is automatically visible natively in Shopify Admin as a Draft Order.
-2. The dedicated Philia Request Command Center provides the richer database/dashboard experience and is iframe-ready for a future embedded Shopify app shell.
+- Customer self-service management requires login **before submitting**; guest submissions remain valid but are not automatically claimed by an account created later. Guests need to contact Philia using the reference number.
+- No SMTP means no email notifications.
+- Shopify app-proxy verification plus ID matching prevents customers from reading another customer's request.
+- The merchant-facing operations happen in Shopify Admin. This is not an embedded, custom Shopify Admin app dashboard.
+- Shopify rendering, permissions, app proxy, and live email delivery cannot be proven by offline unit tests. Perform the live acceptance steps above.
