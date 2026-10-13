@@ -196,10 +196,28 @@ def _proxy_signature_ok(request: Request) -> bool:
 def _proxy_identity(request: Request):
     if not _proxy_signature_ok(request):
         raise HTTPException(401, 'Invalid Shopify app proxy signature.')
-    incoming_shop = request.query_params.get('shop', '').strip()
-    expected = _shop_domain()
-    if expected and incoming_shop and incoming_shop.lower() != expected.lower():
-        raise HTTPException(403, 'Wrong Shopify store.')
+    incoming_shop = request.query_params.get('shop', '').strip().lower().rstrip('.')
+    expected = _shop_domain().lower().rstrip('.')
+    # Shopify keeps an original myshopifyDomain and may also have a branded
+    # primary .myshopify.com domain. Both can refer to this same shop.
+    # Accept only explicitly configured identities, after verifying the signed
+    # app-proxy request above. Never disable signature or customer-ID checks.
+    aliases = {expected} if expected else set()
+    if SHOPIFY_STORE_DOMAIN:
+        aliases.add(SHOPIFY_STORE_DOMAIN.lower().rstrip('.'))
+    if SHOPIFY_SHOP:
+        aliases.add(f'{SHOPIFY_SHOP.lower()}.myshopify.com')
+    aliases.update(
+        item.strip().lower().rstrip('.')
+        for item in os.getenv('SHOPIFY_PROXY_ALLOWED_SHOPS', '').split(',')
+        if item.strip()
+    )
+    if not incoming_shop or (aliases and incoming_shop not in aliases):
+        # Only public domain names are logged. Never log the signed query,
+        # Shopify app secret, tokens, or customer details.
+        print(f'[PHILIA PROXY] signed shop mismatch: incoming={incoming_shop!r}, '
+              f'allowed={sorted(aliases)!r}', flush=True)
+        raise HTTPException(403, 'Wrong Shopify store. Check Render Logs for PHILIA PROXY signed shop mismatch.')
     cid = request.query_params.get('logged_in_customer_id', '').strip() or None
     return cid, incoming_shop
 
